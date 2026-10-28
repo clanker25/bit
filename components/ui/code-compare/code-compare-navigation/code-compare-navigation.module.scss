@@ -1,0 +1,107 @@
+@import '@teambit/ui-foundation.ui.constants.z-indexes/z-indexes.module.scss';
+
+.codeCompareTab {
+  display: flex;
+  align-items: center;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+
+  > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-left: 4px; // to align to sibling with icon
+    margin-right: 8px;
+  }
+
+  img {
+    width: 16px;
+    height: 16px;
+    margin-right: 4px;
+  }
+}
+
+.icon {
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+}
+
+.compareNavItem {
+  // inherits the page theme; was pinned white for the always-dark diff.
+  color: var(--on-surface-color, #2b2b2b) !important;
+  border-right: 0.5px solid var(--border-medium-color, #ededed);
+  // override the default menu item padding
+  padding: 0px !important;
+
+  &.first {
+    border-left: 0.5px solid var(--border-medium-color, #ededed);
+  }
+
+  &:hover:not(.activeNav) {
+    background-color: var(--surface-neutral-color, #fff) !important;
+    > div {
+      background-color: var(--surface-neutral-color, #fff) !important;
+    }
+  }
+}
+
+.activeNav {
+  background-color: var(--surface-neutral-color, #fff);
+  border-bottom: 2px solid var(--primary-color, #6a57fd);
+
+  &::after {
+    background-color: var(--surface-neutral-color, #fff) !important;
+  }
+}
+
+.compareNav {
+  // surface token, not the `on-surface` foreground (grey on a light page).
+  background-color: var(--surface-color, #fff);
+  gap: 0px !important;
+}
+
+.compareSecondaryNav {
+  background: var(--surface-color, #fff) !important;
+  overflow-y: auto;
+  max-height: 300px;
+}
+
+.codeCompareTabRight {
+  display: flex;
+  align-items: center;
+
+  > * {
+    margin-right: 4px;
+  }
+  > :last-child() {
+    margin-right: 0px;
+  }
+}
+
+.codeCompareMenu {
+  z-index: $modal-z-index;
+  top: 100%;
+  right: 50%;
+  background: var(--surface-color, #fff) !important;
+  color: var(--on-surface-color, #2b2b2b);
+  min-width: 200px;
+}
+
+.codeCompareWidgets {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  margin-right: 4px;
+
+  .settings {
+    cursor: pointer;
+
+    img {
+      display: flex;
+      width: 16px;
+    }
+  }
+}

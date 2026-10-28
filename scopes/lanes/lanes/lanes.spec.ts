@@ -1,0 +1,610 @@
+import { expect } from 'chai';
+import fs from 'fs-extra';
+import path from 'path';
+import type { Harmony } from '@teambit/harmony';
+import { loadAspect, loadManyAspects } from '@teambit/harmony.testing.load-aspect';
+import type { RemoveMain } from '@teambit/remove';
+import { RemoveAspect } from '@teambit/remove';
+import type { SnappingMain } from '@teambit/snapping';
+import { SnappingAspect } from '@teambit/snapping';
+import type { Workspace } from '@teambit/workspace';
+import { WorkspaceAspect } from '@teambit/workspace';
+import type { ExportMain } from '@teambit/export';
+import { ExportAspect } from '@teambit/export';
+import { LaneId } from '@teambit/lane-id';
+import type { WorkspaceData } from '@teambit/workspace.testing.mock-workspace';
+import { mockWorkspace, destroyWorkspace } from '@teambit/workspace.testing.mock-workspace';
+import { mockComponents, modifyMockedComponents } from '@teambit/component.testing.mock-components';
+import { ChangeType } from '@teambit/lanes.entities.lane-diff';
+import { ComponentID } from '@teambit/component-id';
+import { partitionSwitchIds } from './switch-lanes';
+import { LanesAspect } from './lanes.aspect';
+import type { LanesMain, LaneUpdateDependentsSource } from './lanes.main.runtime';
+import { LaneUpdatesCmd } from './lane.cmd';
+import { GraphqlAspect, type GraphqlMain } from '@teambit/graphql';
+import { loadScope } from '@teambit/legacy.scope';
+
+describe('LanesAspect', function () {
+  this.timeout(0);
+
+  describe('getLanes()', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      lanes = await loadAspect(LanesAspect, workspacePath);
+      await lanes.createLane('stage');
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should list all lanes', async () => {
+      const currentLanes = await lanes.getLanes({});
+      expect(currentLanes).to.have.lengthOf(1);
+      expect(currentLanes[0].name).to.equal('stage');
+    });
+  });
+
+  describe('isLaneUpToDate', () => {
+    let lanes: LanesMain;
+    let snapping: SnappingMain;
+    let workspaceData: WorkspaceData;
+    let harmony: Harmony;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      harmony = await loadManyAspects([SnappingAspect, ExportAspect, LanesAspect, WorkspaceAspect], workspacePath);
+      snapping = harmony.get(SnappingAspect.id);
+      await snapping.tag({ ids: ['comp1'], build: false, ignoreIssues: 'MissingManuallyConfiguredPackages' });
+      const exporter: ExportMain = harmony.get(ExportAspect.id);
+      await exporter.export();
+      lanes = harmony.get(LanesAspect.id);
+      await lanes.createLane('stage');
+      await modifyMockedComponents(workspacePath, 'v2');
+      const result = await snapping.snap({
+        pattern: 'comp1',
+        build: false,
+        ignoreIssues: 'MissingManuallyConfiguredPackages',
+      });
+      // intermediate step, make sure it is snapped
+      expect(result?.snappedComponents.length).to.equal(1);
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should return that the lane is up to date when the lane is ahead of main', async () => {
+      const currentLane = await lanes.getCurrentLane();
+      if (!currentLane) throw new Error('unable to get the current lane');
+      const isUpToDate = (
+        await lanes.diffStatus(currentLane.toLaneId(), undefined, { skipChanges: true })
+      ).componentsStatus.every((c) => c.upToDate);
+
+      expect(isUpToDate).to.be.true;
+    });
+    it('should return that the lane is not up to date when main is ahead', async () => {
+      const currentLane = await lanes.getCurrentLane();
+      if (!currentLane) throw new Error('unable to get the current lane');
+      await lanes.switchLanes('main', { skipDependencyInstallation: true });
+      await snapping.snap({
+        pattern: 'comp1',
+        build: false,
+        unmodified: true,
+        ignoreIssues: 'MissingManuallyConfiguredPackages',
+      });
+      const isUpToDate = (
+        await lanes.diffStatus(currentLane.toLaneId(), undefined, { skipChanges: true })
+      ).componentsStatus.every((c) => c.upToDate);
+
+      expect(isUpToDate).to.be.false;
+    });
+  });
+
+  describe('laneDiff', () => {
+    let harmony: Harmony;
+    let lanes: LanesMain;
+    let snapping: SnappingMain;
+    let workspaceData: WorkspaceData;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      harmony = await loadManyAspects([SnappingAspect, ExportAspect, LanesAspect, WorkspaceAspect], workspacePath);
+      snapping = harmony.get(SnappingAspect.id);
+      await snapping.tag({ ids: ['comp1'], build: false });
+      const exporter: ExportMain = harmony.get(ExportAspect.id);
+      await exporter.export();
+      lanes = harmony.get(LanesAspect.id);
+      await lanes.createLane('stage');
+      const result = await snapping.snap({ pattern: 'comp1', build: false, unmodified: true });
+      // intermediate step, make sure it is snapped
+      expect(result?.snappedComponents.length).to.equal(1);
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should return that the lane is up to date when the lane is ahead of main', async () => {
+      const currentLane = await lanes.getCurrentLane();
+      if (!currentLane) throw new Error('unable to get the current lane');
+      const laneDiffResults = await lanes.diffStatus(currentLane.toLaneId());
+      expect(laneDiffResults.componentsStatus[0].upToDate).to.be.true;
+      expect(laneDiffResults.componentsStatus[0].changeType).to.equal(ChangeType.NONE);
+    });
+    it('should return that the lane is not up to date when main is ahead', async () => {
+      const currentLane = await lanes.getCurrentLane();
+      if (!currentLane) throw new Error('unable to get the current lane');
+      await lanes.switchLanes('main', { skipDependencyInstallation: true });
+      await snapping.snap({ pattern: 'comp1', build: false, unmodified: true });
+
+      const laneDiffResults = await lanes.diffStatus(currentLane.toLaneId());
+      expect(laneDiffResults.componentsStatus[0].upToDate).to.be.false;
+      expect(laneDiffResults.componentsStatus[0].changeType).to.equal(ChangeType.NONE);
+    });
+  });
+
+  describe('restoreLane()', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      lanes = await loadAspect(LanesAspect, workspacePath);
+      await lanes.createLane('stage');
+
+      // as an intermediate step, make sure the lane was created
+      const currentLanes = await lanes.getLanes({});
+      expect(currentLanes).to.have.lengthOf(1);
+
+      await lanes.switchLanes('main', { skipDependencyInstallation: true });
+      await lanes.removeLanes(['stage']);
+
+      // as an intermediate step, make sure the lane was removed
+      const lanesAfterDelete = await lanes.getLanes({});
+      expect(lanesAfterDelete).to.have.lengthOf(0);
+
+      await lanes.restoreLane(currentLanes[0].hash);
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should restore the deleted lane', async () => {
+      const currentLanes = await lanes.getLanes({});
+      expect(currentLanes).to.have.lengthOf(1);
+      expect(currentLanes[0].id.name).to.equal('stage');
+    });
+    describe('delete restored lane', () => {
+      let output: string[];
+      before(async () => {
+        output = await lanes.removeLanes(['stage']);
+      });
+      it('should not throw', () => {
+        expect(output).to.have.lengthOf(1);
+      });
+    });
+  });
+
+  describe('restore lane when an existing lane has the same id', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    let laneHash: string;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      lanes = await loadAspect(LanesAspect, workspacePath);
+      await lanes.createLane('stage');
+
+      // as an intermediate step, make sure the lane was created
+      const currentLanes = await lanes.getLanes({});
+      expect(currentLanes).to.have.lengthOf(1);
+
+      await lanes.switchLanes('main', { skipDependencyInstallation: true });
+      await lanes.removeLanes(['stage']);
+
+      await lanes.createLane('stage');
+      laneHash = currentLanes[0].hash;
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should throw when restoring the lane', async () => {
+      let error: Error | undefined;
+      try {
+        await lanes.restoreLane(laneHash);
+      } catch (err: any) {
+        error = err;
+      }
+      expect(error).to.be.instanceOf(Error);
+      expect(error?.message).to.include('unable to restore lane');
+    });
+  });
+
+  describe('lane history', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    let snapping: SnappingMain;
+    let laneId: LaneId;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      lanes = await loadAspect(LanesAspect, workspacePath);
+      await lanes.createLane('stage');
+      snapping = await loadAspect(SnappingAspect, workspacePath);
+      const currentLaneId = lanes.getCurrentLaneId();
+      if (!currentLaneId) throw new Error('unable to get the current lane-id');
+      laneId = currentLaneId;
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should create lane history object when creating a new lane', async () => {
+      const laneHistory = await lanes.getLaneHistory(laneId);
+      const history = laneHistory.getHistory();
+      expect(Object.keys(history).length).to.equal(1);
+    });
+    describe('snapping', () => {
+      let snappingResult;
+      before(async () => {
+        snappingResult = await snapping.snap({ pattern: 'comp1', build: false, message: 'first snap' });
+      });
+      it('should add a record to LaneHistory when snapping', async () => {
+        const laneHistory = await lanes.getLaneHistory(laneId);
+        const history = laneHistory.getHistory();
+        expect(Object.keys(history).length).to.equal(2);
+        const snapHistory = history[Object.keys(history)[1]];
+        expect(snapHistory.log.message).to.equal('snap (first snap)');
+        expect(snapHistory.components.length).to.equal(1);
+        expect(snapHistory.components[0]).to.equal(snappingResult?.snappedComponents[0].id.toString() as string);
+      });
+      describe('snap again and export', () => {
+        let exportResults;
+
+        before(async () => {
+          const compFile = path.join(workspaceData.workspacePath, 'comp1/index.js');
+          await fs.appendFile(compFile, `\nconsole.log('second-snap');`);
+          // make another snap to check to test the checkout later.
+          await snapping.snap({ pattern: 'comp1', build: false, message: 'second snap' });
+          const laneHistory = await lanes.getLaneHistory(laneId);
+          const history = laneHistory.getHistory();
+          expect(Object.keys(history).length).to.equal(3);
+
+          const exporter: ExportMain = await loadAspect(ExportAspect, workspaceData.workspacePath);
+          exportResults = await exporter.export();
+        });
+        it('should export successfully', () => {
+          expect(exportResults.componentsIds.length).to.equal(1);
+          expect(exportResults.exportedLanes.length).to.equal(1);
+        });
+        describe('import to another workspace', () => {
+          let newWorkspace: WorkspaceData;
+          before(async () => {
+            newWorkspace = mockWorkspace({ bareScopeName: workspaceData.remoteScopeName });
+
+            lanes = await loadAspect(LanesAspect, newWorkspace.workspacePath);
+            await lanes.switchLanes(laneId.toString(), { skipDependencyInstallation: true });
+            await lanes.importLaneObject(laneId, true, true);
+          });
+          after(async () => {
+            await destroyWorkspace(newWorkspace);
+          });
+          it('should not add a record to the lane-history', async () => {
+            const laneHistory = await lanes.getLaneHistory(laneId);
+            const history = laneHistory.getHistory();
+            expect(Object.keys(history).length).to.equal(3);
+          });
+          it('should be able to checkout to a previous state of the lane', async () => {
+            const laneHistory = await lanes.getLaneHistory(laneId);
+            const history = laneHistory.getHistory();
+            const snapHistoryId = Object.keys(history).find((key) => history[key].log.message?.includes('first snap'));
+            if (!snapHistoryId) throw new Error('unable to find snap history of the first snap');
+            const results = await lanes.checkoutHistory(snapHistoryId, { skipDependencyInstallation: true });
+            expect(results.components?.length).to.equal(1);
+            expect(results.failedComponents?.length).to.equal(0);
+          });
+          it('should be able to revert to a previous history id', async () => {
+            const revertWorkspace = mockWorkspace({ bareScopeName: workspaceData.remoteScopeName });
+            lanes = await loadAspect(LanesAspect, revertWorkspace.workspacePath);
+            await lanes.switchLanes(laneId.toString(), { skipDependencyInstallation: true });
+            await lanes.importLaneObject(laneId, true, true);
+            const laneHistory = await lanes.getLaneHistory(laneId);
+            const history = laneHistory.getHistory();
+            const snapHistoryId = Object.keys(history).find((key) => history[key].log.message?.includes('first snap'));
+            if (!snapHistoryId) throw new Error('unable to find snap history of the first snap');
+            const results = await lanes.revertHistory(snapHistoryId, { skipDependencyInstallation: true });
+            expect(results.components?.length).to.equal(1);
+            expect(results.failedComponents?.length).to.equal(0);
+
+            const compFile = path.join(
+              revertWorkspace.workspacePath,
+              revertWorkspace.remoteScopeName,
+              'comp1/index.js'
+            );
+            const compFileContent = await fs.readFile(compFile, 'utf8');
+
+            // make sure it reverts to the first snap.
+            expect(compFileContent).to.not.include('second-snap');
+
+            // make sure it keeps the version in .bitmap intact and doesn't change it to the first snap. (as with checkout)
+            const secondSnapHistoryId = Object.keys(history).find((key) =>
+              history[key].log.message?.includes('second snap')
+            );
+            if (!secondSnapHistoryId) throw new Error('unable to find snap history of the second snap');
+            const secondSnapHistory = history[secondSnapHistoryId];
+            const workspace: Workspace = await loadAspect(WorkspaceAspect, revertWorkspace.workspacePath);
+            const ids = await workspace.listIds();
+            expect(ids[0].toString()).to.equal(secondSnapHistory.components[0]);
+            await destroyWorkspace(revertWorkspace);
+          });
+        });
+      });
+    });
+  });
+
+  describe('create lanes with the same name different scope', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      lanes = await loadAspect(LanesAspect, workspacePath);
+      await lanes.createLane('stage');
+      await lanes.switchLanes('main', { skipDependencyInstallation: true });
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should not throw when creating the second lane', async () => {
+      await lanes.createLane('stage', { scope: 'new-scope' });
+      const currentLanes = await lanes.getLanes({});
+      expect(currentLanes.length).to.equal(2);
+      expect(currentLanes[0].id.name).to.equal('stage');
+      expect(currentLanes[1].id.name).to.equal('stage');
+    });
+  });
+
+  // todo: fix after deleting teambit.legacy
+  // for some reason it is trying to add the core-aspect teambit.component/remove to the graph and then
+  // it complains that it has no version. from the cli it doesn't happen.
+  describe.skip('delete component on a lane after export', () => {
+    let lanes: LanesMain;
+    let workspaceData: WorkspaceData;
+    let snapping: SnappingMain;
+    let laneId: LaneId;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      await mockComponents(workspacePath);
+      const harmony = await loadManyAspects(
+        [SnappingAspect, ExportAspect, RemoveAspect, WorkspaceAspect, LanesAspect],
+        workspaceData.workspacePath
+      );
+      lanes = harmony.get(LanesAspect.id);
+      await lanes.createLane('stage');
+
+      const currentLaneId = lanes.getCurrentLaneId();
+      if (!currentLaneId) throw new Error('unable to get the current lane-id');
+      laneId = currentLaneId;
+
+      snapping = harmony.get(SnappingAspect.id);
+      await snapping.snap({ build: false });
+      const exporter: ExportMain = harmony.get(ExportAspect.id);
+      await exporter.export();
+
+      const remove: RemoveMain = harmony.get(RemoveAspect.id);
+      await remove.deleteComps('comp1');
+
+      await snapping.snap({ build: false });
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should save the deleted data into the lane object', async () => {
+      const lane = await lanes.getCurrentLane();
+      expect(lane?.components[0].isDeleted).to.be.true;
+    });
+    it('should save the deleted data into lane history', async () => {
+      const laneHistory = await lanes.getLaneHistory(laneId);
+      const history = laneHistory.getHistory();
+      expect(Object.keys(history).length).to.equal(3);
+      const snapHistory = history[Object.keys(history)[2]];
+      expect(snapHistory.deleted?.length).to.equal(1);
+    });
+  });
+});
+
+/**
+ * TODO: this should not be here. It belongs to the GraphQL aspect.
+ * The reason it was moved here is that otherwise, it forms circular dependencies.
+ * we should think of a better way to handle this.
+ */
+describe('GraphQL Aspect', function () {
+  this.timeout(0);
+
+  describe('getSchemas and getSchema APIs', () => {
+    let graphql: GraphqlMain;
+    let workspaceData: WorkspaceData;
+    before(async () => {
+      workspaceData = mockWorkspace();
+      const { workspacePath } = workspaceData;
+      const harmony = await loadManyAspects([WorkspaceAspect, GraphqlAspect, LanesAspect], workspacePath);
+      graphql = harmony.get<GraphqlMain>(GraphqlAspect.id);
+    });
+    after(async () => {
+      await destroyWorkspace(workspaceData);
+    });
+    it('should bring the schemas when calling getSchemas API', async () => {
+      const schemas = graphql.getSchemas([LanesAspect.id]);
+      expect(schemas).to.be.an('array');
+      expect(schemas).to.have.lengthOf(1);
+      expect(schemas[0]).to.be.an('object');
+      expect(schemas[0]).to.not.be.an('function');
+    });
+    it('should bring the schemas when calling getSchema API', async () => {
+      const schema = graphql.getSchema(LanesAspect.id);
+      expect(schema).to.be.an('object');
+      expect(schema).to.not.be.an('function');
+    });
+  });
+});
+
+describe('partitionSwitchIds', () => {
+  const id = (idStr: string) => ComponentID.fromString(idStr);
+  const ours = id('acme.shop/comp1');
+  const oursOnMainOnly = id('acme.shop/comp2');
+  const foreign = id('other.scope/table');
+
+  it('without a restriction: every lane component is taken, main-only components come along', () => {
+    const { ids, laneBitIds } = partitionSwitchIds([ours, foreign], [ours, oursOnMainOnly]);
+    expect(ids.map((i) => i.toString())).to.have.members([
+      oursOnMainOnly.toString(),
+      ours.toString(),
+      foreign.toString(),
+    ]);
+    // on the lane but not in the workspace's main set
+    expect(laneBitIds.map((i) => i.toString())).to.deep.equal([foreign.toString()]);
+  });
+
+  it('a restricted-out lane component is not taken from the lane', () => {
+    const { ids, laneBitIds } = partitionSwitchIds([ours, foreign], [ours], ['acme.shop']);
+    expect(ids.map((i) => i.toString())).to.deep.equal([ours.toString()]);
+    expect(laneBitIds).to.deep.equal([]);
+  });
+
+  // The regression this guards: filtering only the lane side lets a restricted-out component
+  // reappear as "main-only", which checks it out at its main version and writes it after all.
+  it('a restricted-out lane component the workspace tracks is left untouched, not reverted to main', () => {
+    const { ids } = partitionSwitchIds([ours, foreign], [ours, foreign], ['acme.shop']);
+    expect(ids.map((i) => i.toString())).to.deep.equal([ours.toString()]);
+    expect(ids.map((i) => i.toString())).to.not.include(foreign.toString());
+  });
+
+  it('a main-only component that the lane never carried is still taken at its main version', () => {
+    const { ids } = partitionSwitchIds([ours], [ours, oursOnMainOnly], ['acme.shop']);
+    expect(ids.map((i) => i.toString())).to.have.members([oursOnMainOnly.toString(), ours.toString()]);
+  });
+});
+
+describe('lane updates (Ripple CI cascade entries)', function () {
+  this.timeout(0);
+  let lanes: LanesMain;
+  let workspaceData: WorkspaceData;
+  let laneId: LaneId;
+  let cascadedId: ComponentID;
+  before(async () => {
+    workspaceData = mockWorkspace();
+    const { workspacePath, remoteScopePath } = workspaceData;
+    await mockComponents(workspacePath);
+    const harmony = await loadManyAspects([SnappingAspect, ExportAspect, LanesAspect, WorkspaceAspect], workspacePath);
+    const snapping: SnappingMain = harmony.get(SnappingAspect.id);
+    lanes = harmony.get(LanesAspect.id);
+    await lanes.createLane('stage');
+    await snapping.snap({ pattern: 'comp1', build: false, ignoreIssues: 'MissingManuallyConfiguredPackages' });
+    const exporter: ExportMain = harmony.get(ExportAspect.id);
+    await exporter.export();
+    laneId = lanes.getCurrentLaneId() as LaneId;
+
+    // mimic the Ripple CI cascade producer: add a hidden update-dependents entry (a dependent of comp1, which
+    // doesn't need to exist for the lane object) to the lane on the remote. the remote scope is loaded through
+    // the cache on purpose, so the Fs network the workspace uses to reach this remote sees the same objects.
+    const remoteScope = await loadScope(remoteScopePath);
+    const remoteLane = await remoteScope.lanes.loadLane(laneId);
+    if (!remoteLane) throw new Error('expected the lane to exist on the remote after export');
+    const [laneComponent] = remoteLane.components;
+    cascadedId = ComponentID.fromString(`${laneComponent.id.scope}/dependent-of-comp1`).changeVersion(
+      laneComponent.head.toString()
+    );
+    remoteLane.addComponentToUpdateDependents(cascadedId);
+    await remoteScope.lanes.saveLane(remoteLane, { laneHistoryMsg: 'test: cascade update-dependents' });
+  });
+  after(async () => {
+    await destroyWorkspace(workspaceData);
+  });
+  it('getLaneUpdateDependents() should read the cascaded entries from the remote lane', async () => {
+    const result = await lanes.getLaneUpdateDependents(laneId);
+    expect(result.source).to.equal('remote');
+    expect(result.ids.map((id) => id.toString())).to.deep.equal([cascadedId.toString()]);
+  });
+  it('undoLaneUpdateDependents() should remove the entries from the remote lane', async () => {
+    const result = await lanes.undoLaneUpdateDependents(laneId);
+    expect(result.remoteChanged).to.be.true;
+    expect(result.remoteSkipped).to.be.false;
+    expect(result.removed.map((id) => id.toString())).to.deep.equal([cascadedId.toString()]);
+
+    const remoteScope = await loadScope(workspaceData.remoteScopePath);
+    const remoteLane = await remoteScope.lanes.loadLane(laneId);
+    expect(remoteLane?.updateDependents).to.be.undefined;
+
+    const after = await lanes.getLaneUpdateDependents(laneId);
+    expect(after.source).to.equal('remote');
+    expect(after.ids).to.have.lengthOf(0);
+  });
+  it('undoLaneUpdateDependents() should clean local entries the remote no longer has', async () => {
+    // mimic an undo whose remote removal succeeded but whose local save failed: the previous test left the
+    // remote lane clean, so re-adding the entry locally makes it stale by definition.
+    const remoteIds = await lanes.getLaneUpdateDependents(laneId);
+    expect(remoteIds.ids).to.have.lengthOf(0);
+    const localScope = await loadScope(path.join(workspaceData.workspacePath, '.bit'));
+    const localLane = await localScope.lanes.loadLane(laneId);
+    if (!localLane) throw new Error('expected the lane to exist locally');
+    localLane.addComponentToUpdateDependents(cascadedId);
+    await localScope.lanes.saveLane(localLane, { laneHistoryMsg: 'test: stale local entry' });
+
+    const result = await lanes.undoLaneUpdateDependents(laneId);
+    expect(result.removed).to.have.lengthOf(0);
+    expect(result.remoteChanged).to.be.false;
+    expect(result.localChanged).to.be.true;
+
+    const afterLocal = await localScope.lanes.loadLane(laneId);
+    expect(afterLocal?.updateDependents).to.be.undefined;
+  });
+  it('removeUpdateDependents() should remove nothing when given an empty list, not everything', async () => {
+    // an empty list means the caller resolved zero entries. reading it as "remove all" would let a
+    // remote call that asks to remove nothing wipe the whole cascade.
+    const localScope = await loadScope(path.join(workspaceData.workspacePath, '.bit'));
+    const localLane = await localScope.lanes.loadLane(laneId);
+    if (!localLane) throw new Error('expected the lane to exist locally');
+    localLane.addComponentToUpdateDependents(cascadedId);
+    await localScope.lanes.saveLane(localLane, { laneHistoryMsg: 'test: entry that must survive' });
+
+    expect(await lanes.removeUpdateDependents(laneId, [])).to.be.false;
+    const afterEmpty = await localScope.lanes.loadLane(laneId);
+    expect(afterEmpty?.updateDependents?.map((id) => id.toString())).to.deep.equal([cascadedId.toString()]);
+
+    // omitting the ids is what removes all of them
+    expect(await lanes.removeUpdateDependents(laneId)).to.be.true;
+    const afterAll = await localScope.lanes.loadLane(laneId);
+    expect(afterAll?.updateDependents).to.be.undefined;
+  });
+});
+
+describe('LaneUpdatesCmd', () => {
+  const stubbedLaneId = LaneId.from('my-lane', 'org.scope');
+  function createCmd(result: { source: LaneUpdateDependentsSource; remoteError?: string }) {
+    const lanes = {
+      getCurrentLaneId: () => stubbedLaneId,
+      getLaneUpdateDependents: async () => ({ laneId: stubbedLaneId, ids: [], ...result }),
+    } as unknown as LanesMain;
+    return new LaneUpdatesCmd(lanes);
+  }
+  it('should say the lane is missing on the remote, rather than report a fetch failure', async () => {
+    const output = await createCmd({ source: 'no-remote-lane' }).report([''], {});
+    expect(output).to.include('not found on the remote');
+    expect(output).to.not.include('undefined');
+  });
+  it('should report the remote error when the fetch actually failed', async () => {
+    const output = await createCmd({ source: 'remote-unavailable', remoteError: 'connection refused' }).report(
+      [''],
+      {}
+    );
+    expect(output).to.include('could not be fetched: connection refused');
+  });
+  it('should not add a source hint when the entries came from the remote', async () => {
+    const output = await createCmd({ source: 'remote' }).report([''], {});
+    expect(output).to.not.include('showing the local lane object');
+  });
+});

@@ -1,0 +1,39 @@
+import { expect } from 'chai';
+import sinon from 'sinon';
+import { ComponentIdList } from '@teambit/component-id';
+
+import Consumer from './consumer';
+import { MissingBitMapComponent } from '@teambit/legacy.bit-map';
+
+describe('Consumer', function () {
+  this.timeout(0);
+  let sandbox;
+  const getConsumerInstance = () => {
+    const consumer = new Consumer({
+      projectPath: '',
+      // @ts-ignore
+      config: {},
+      // @ts-ignore
+      scope: { getPath: () => '', lanes: { getCurrentLaneName: () => '' } },
+    });
+    // @ts-ignore
+    consumer.bitMap = {
+      getAllBitIdsFromAllLanes: () => new ComponentIdList(),
+    };
+    return consumer;
+  };
+  describe('getParsedIdIfExist', () => {
+    let consumer;
+    before(() => {
+      sandbox = sinon.createSandbox();
+      consumer = getConsumerInstance();
+    });
+    after(() => {
+      sandbox.restore();
+    });
+    it('should throw an error for a missing component', () => {
+      const func = () => consumer.getParsedIdIfExist('non-exist-comp');
+      expect(func).to.not.throw(MissingBitMapComponent);
+    });
+  });
+});

@@ -1,0 +1,244 @@
+import { expect } from 'chai';
+import { ComponentID } from '@teambit/component-id';
+import { ExtensionDataEntry } from './extension-data';
+import { ExtensionDataList } from './extension-data-list';
+
+describe('ExtensionDataList', () => {
+  describe('merge lists', () => {
+    let mergedAsObject;
+    before(() => {
+      const list1 = ExtensionDataList.fromConfigObject({
+        'my-scope/ext1': {
+          conf1: 'val2',
+          conf4: 'val4',
+        },
+        'my-scope/ext4': {
+          conf1: 'val1',
+        },
+        'my-scope/ext5': '-',
+        'my-scope/ext6': {
+          conf1: 'val1',
+        },
+      });
+      const list2 = ExtensionDataList.fromConfigObject({
+        'my-scope/ext1': {
+          conf1: 'val2',
+          conf2: 'val2',
+        },
+        'my-scope/ext3': {
+          conf1: 'val1',
+        },
+        'my-scope/ext5': {
+          conf1: 'val1',
+        },
+        'my-scope/ext6': '-',
+      });
+      const list3 = ExtensionDataList.fromConfigObject({
+        'my-scope/ext1': {
+          conf1: 'val1',
+          conf3: 'val3',
+        },
+        'my-scope/ext2': {
+          conf1: 'val1',
+        },
+      });
+
+      const merged = ExtensionDataList.mergeConfigs([list1, list2, list3]);
+      mergedAsObject = merged.toConfigObject();
+    });
+    it('should take the former occurrence of an extension', () => {
+      expect(mergedAsObject['my-scope/ext1']).to.deep.equal({
+        conf1: 'val2',
+        conf4: 'val4',
+      });
+    });
+    it('should handle merge for special remove sign', () => {
+      expect(mergedAsObject['my-scope/ext5']).to.deep.equal('-');
+      expect(mergedAsObject['my-scope/ext6']).to.deep.equal({
+        conf1: 'val1',
+      });
+    });
+    it('should take extensions from all lists', () => {
+      expect(mergedAsObject['my-scope/ext2']).to.deep.equal({
+        conf1: 'val1',
+      });
+      expect(mergedAsObject['my-scope/ext3']).to.deep.equal({
+        conf1: 'val1',
+      });
+      expect(mergedAsObject['my-scope/ext4']).to.deep.equal({
+        conf1: 'val1',
+      });
+    });
+  });
+  describe('sort lists', () => {
+    let sorted;
+    before(() => {
+      const list = ExtensionDataList.fromConfigObject({
+        'my-scope/ext3': {
+          conf1: 'val1',
+        },
+        'my-scope/ext1': {
+          conf1: 'val2',
+          conf4: 'val4',
+        },
+        'my-scope/ext4': {
+          conf1: 'val1',
+        },
+      });
+
+      sorted = list.sortById();
+    });
+    it('should sort the list by ids', () => {
+      expect(sorted[0].stringId).to.equal('my-scope/ext1');
+      expect(sorted[1].stringId).to.equal('my-scope/ext3');
+      expect(sorted[2].stringId).to.equal('my-scope/ext4');
+    });
+  });
+  describe('filter removed', () => {
+    let filtered;
+    let filteredAsObject;
+    before(() => {
+      const list = ExtensionDataList.fromConfigObject({
+        'my-scope/ext3': {
+          conf1: 'val1',
+        },
+        'my-scope/ext1': {
+          conf1: 'val2',
+          conf4: 'val4',
+        },
+        'my-scope/ext4': '-',
+      });
+
+      filtered = list.filterRemovedExtensions();
+      filteredAsObject = filtered.toConfigObject();
+    });
+    it('should sort the list by ids', () => {
+      expect(filtered.length).to.equal(2);
+      expect(filteredAsObject).to.not.have.property('my-scope/ext4');
+    });
+  });
+  describe('extensionsBitIds order normalization (regression for false-positive "modified" status)', () => {
+    // a component was wrongly reported as modified by "bit status" while "bit diff" showed no diff, because the
+    // order of `extensionDependencies` (derived from `extensionsBitIds`) differed between the stored model
+    // Version and the recomputed filesystem Version. that order is serialized into Version.id()/calculateHash(),
+    // so a mere reorder (e.g. the env aspect moving position) flipped the hash. the modified-check now sorts the
+    // extensions by id first, which must yield a deterministic extensionsBitIds order regardless of input order.
+    const buildList = (ids: string[]) =>
+      ExtensionDataList.fromArray(ids.map((id) => new ExtensionDataEntry(undefined, ComponentID.fromString(id))));
+    let fromModelOrder: string[];
+    let fromFsOrder: string[];
+    before(() => {
+      const idsInModelOrder = [
+        'teambit.dot-cloud/osv-scanner@0.0.2',
+        'teambit.dot-cloud/trivy-scanner@0.0.2',
+        'teambit.dot-symphony/envs/aspect@0.0.9',
+        'teambit.dot-cloud/bit-cloud@0.0.1',
+      ];
+      const idsInFsOrder = [
+        'teambit.dot-symphony/envs/aspect@0.0.9',
+        'teambit.dot-cloud/osv-scanner@0.0.2',
+        'teambit.dot-cloud/trivy-scanner@0.0.2',
+        'teambit.dot-cloud/bit-cloud@0.0.1',
+      ];
+      fromModelOrder = buildList(idsInModelOrder)
+        .sortById()
+        .extensionsBitIds.map((id) => id.toString());
+      fromFsOrder = buildList(idsInFsOrder)
+        .sortById()
+        .extensionsBitIds.map((id) => id.toString());
+    });
+    it('should produce the same extensionsBitIds order after sortById, regardless of input order', () => {
+      expect(fromFsOrder).to.deep.equal(fromModelOrder);
+    });
+  });
+  describe('to config array', () => {
+    let configArr;
+    before(() => {
+      const configEntry = new ExtensionDataEntry(undefined, ComponentID.fromString('my-scope/ext1'), undefined, {
+        conf1: 'val1',
+      });
+      const dataEntry = new ExtensionDataEntry(
+        undefined,
+        ComponentID.fromString('my-scope/ext2'),
+        undefined,
+        {},
+        { data1: 'val1' }
+      );
+      const dataConfigEntry = new ExtensionDataEntry(
+        undefined,
+        ComponentID.fromString('my-scope/ext3'),
+        undefined,
+        { conf3: 'val3' },
+        { data3: 'val3' }
+      );
+      const list = ExtensionDataList.fromArray([configEntry, dataEntry, dataConfigEntry]);
+      configArr = list.toConfigArray();
+    });
+    it('should not have entries with data only', () => {
+      expect(configArr.length).to.equal(2);
+    });
+    it('should have entries with config only', () => {
+      expect(configArr[0].id.toString()).to.equal('my-scope/ext1');
+      expect(configArr[0].config).to.deep.equal({ conf1: 'val1' });
+    });
+    it('should have entries with data and config but without the data', () => {
+      expect(configArr[1].id.toString()).to.equal('my-scope/ext3');
+      expect(configArr[1].config).to.deep.equal({ conf3: 'val3' });
+      expect(configArr[1].data).to.be.undefined;
+    });
+  });
+  describe('to config array, internal fields and removed extensions', () => {
+    let entry: ExtensionDataEntry;
+    let configArr;
+    before(() => {
+      entry = new ExtensionDataEntry(undefined, ComponentID.fromString('my-scope/ext1'), undefined, {
+        conf1: 'val1',
+        __specific: true,
+      });
+      const removedEntry = new ExtensionDataEntry(undefined, ComponentID.fromString('my-scope/ext2'), undefined, '-');
+      configArr = ExtensionDataList.fromArray([entry, removedEntry]).toConfigArray();
+    });
+    it('should leave out the internal fields without changing the original config', () => {
+      expect(configArr[0].config).to.deep.equal({ conf1: 'val1' });
+      expect(entry.rawConfig).to.deep.equal({ conf1: 'val1', __specific: true });
+    });
+    it('should return an empty config for a removed extension', () => {
+      expect(configArr[1]).to.deep.equal({ id: 'my-scope/ext2', config: {} });
+    });
+  });
+  describe('adjust envs on config object', () => {
+    it('should move the env version to the root of the object', () => {
+      const conf: Record<string, any> = { 'teambit.envs/envs': { env: 'my-scope/my-env@1.0.0' } };
+      ExtensionDataList.adjustEnvsOnConfigObject(conf);
+      expect(conf).to.deep.equal({ 'teambit.envs/envs': { env: 'my-scope/my-env' }, 'my-scope/my-env@1.0.0': {} });
+    });
+    it('should keep the env specific when it is set specifically', () => {
+      const conf: Record<string, any> = { 'teambit.envs/envs': { env: 'my-scope/my-env@1.0.0', __specific: true } };
+      ExtensionDataList.adjustEnvsOnConfigObject(conf);
+      expect(conf).to.deep.equal({
+        'teambit.envs/envs': { env: 'my-scope/my-env', __specific: true },
+        'my-scope/my-env@1.0.0': { __specific: true },
+      });
+    });
+  });
+  describe('without the env replaced by a config object', () => {
+    const list = ExtensionDataList.fromArray([
+      new ExtensionDataEntry(undefined, undefined, 'teambit.envs/envs', { env: 'my-scope/old-env' }),
+      ...ExtensionDataList.fromConfigObject({ 'my-scope/old-env@1.0.0': {}, 'my-scope/ext1': { conf1: 'val1' } }),
+    ]);
+    const withoutEnvReplacedBy = (env?: string) => {
+      const conf: Record<string, any> = env ? { 'teambit.envs/envs': { env } } : {};
+      ExtensionDataList.adjustEnvsOnConfigObject(conf);
+      return list.withoutEnvReplacedBy(conf).ids;
+    };
+    it('should remove the entry of the previous env when the config sets another env', () => {
+      expect(withoutEnvReplacedBy('my-scope/new-env@2.0.0')).to.deep.equal(['teambit.envs/envs', 'my-scope/ext1']);
+    });
+    it('should keep the env entry when the config sets another version of the same env', () => {
+      expect(withoutEnvReplacedBy('my-scope/old-env@2.0.0')).to.deep.equal(list.ids);
+    });
+    it('should keep the env entry when the config does not set an env', () => {
+      expect(withoutEnvReplacedBy()).to.deep.equal(list.ids);
+    });
+  });
+});

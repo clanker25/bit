@@ -1,0 +1,109 @@
+import { expect } from 'chai';
+import path from 'path';
+
+import { Helper, fixtures } from '@teambit/legacy.e2e-helper';
+
+describe('pkg extension', function () {
+  this.timeout(0);
+  let helper: Helper;
+  before(() => {
+    helper = new Helper();
+  });
+  after(() => {
+    helper.scopeHelper.destroy();
+  });
+  describe('config added by the user', function () {
+    let barFooCapsuleDir;
+    let isTypeCapsuleDir;
+
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.fixtures.createComponentBarFoo();
+      helper.fixtures.addComponentBarFoo();
+      helper.fixtures.createComponentUtilsIsType();
+      helper.fs.outputFile(path.join('utils', 'is-type.js'), fixtures.isType);
+      helper.command.addComponent('utils', { i: 'utils/is-type' });
+      const pkgConfig = {
+        packageJson: {
+          'some-key': 'some-val',
+        },
+      };
+      helper.extensions.addExtensionToVariant('bar', 'teambit.pkg/pkg', pkgConfig);
+      helper.command.createCapsuleHarmony('bar/foo');
+      helper.command.createCapsuleHarmony('utils/is-type');
+      // We do this because the create capsule dir with json is not working because of pnpm output
+      barFooCapsuleDir = helper.command.getCapsuleOfComponent('bar/foo');
+      isTypeCapsuleDir = helper.command.getCapsuleOfComponent('utils/is-type');
+    });
+    it('should have the updated config in the package.json of the configured component in capsule', function () {
+      const packageJson = helper.packageJson.read(barFooCapsuleDir);
+      expect(packageJson).to.have.property('some-key', 'some-val');
+    });
+    it('should not have the updated config in the package.json of another component in capsule', function () {
+      const packageJson = helper.packageJson.read(isTypeCapsuleDir);
+      expect(packageJson).to.not.have.property('some-key');
+    });
+    describe('after import', () => {
+      before(() => {
+        helper.command.tagAllComponents();
+        helper.command.export();
+        helper.scopeHelper.reInitWorkspace();
+        helper.scopeHelper.addRemoteScope();
+        helper.command.importComponent('bar/foo');
+      });
+      it('should have the updated config in the package.json of the configured component in capsule', () => {
+        helper.command.createCapsuleHarmony('bar/foo');
+        // We do this because the create capsule dir with json is not working because of pnpm output
+        barFooCapsuleDir = helper.command.getCapsuleOfComponent('bar/foo@0.0.1');
+        const packageJson = helper.packageJson.read(barFooCapsuleDir);
+        expect(packageJson).to.have.property('some-key', 'some-val');
+      });
+    });
+  });
+  describe('config added by extension', function () {
+    const EXTENSIONS_BASE_FOLDER = 'extension-add-config';
+    const config = { key: 'val' };
+    before(() => {
+      helper.scopeHelper.reInitWorkspace({ addRemoteScopeAsDefaultScope: false });
+      helper.fixtures.createComponentBarFoo();
+      helper.fixtures.addComponentBarFoo();
+      helper.fixtures.createComponentUtilsIsType();
+      helper.fs.outputFile(path.join('utils', 'is-type.js'), fixtures.isType);
+      helper.command.addComponent('utils', { i: 'utils/is-type' });
+    });
+
+    describe('extension that add simple config', function () {
+      let barFooCapsuleDir;
+      let isTypeCapsuleDir;
+
+      before(() => {
+        const extensionFolder = path.join(EXTENSIONS_BASE_FOLDER, 'simple-config');
+        helper.fixtures.copyFixtureExtensions(extensionFolder);
+        helper.command.addComponent(extensionFolder);
+        helper.extensions.addExtensionToVariant(`${EXTENSIONS_BASE_FOLDER}/simple-config`, 'teambit.harmony/aspect');
+        helper.extensions.addExtensionToVariant('bar', 'my-scope/simple-config', config);
+        helper.command.install();
+        helper.command.compile();
+        helper.command.createCapsuleHarmony('bar/foo');
+        helper.command.createCapsuleHarmony('utils/is-type');
+        // We do this because the create capsule dir with json is not working because of pnpm output
+        barFooCapsuleDir = helper.command.getCapsuleOfComponent('bar/foo');
+        isTypeCapsuleDir = helper.command.getCapsuleOfComponent('utils/is-type');
+      });
+      it('should have the updated config in the package.json of the component with the defined extension in capsule', function () {
+        const packageJson = helper.packageJson.read(barFooCapsuleDir);
+        expect(packageJson).to.have.property('my-custom-key', 'my-custom-val');
+      });
+      it('should not have the updated config in the package.json of another component without the defined extension in capsule', function () {
+        const packageJson = helper.packageJson.read(isTypeCapsuleDir);
+        expect(packageJson).to.not.have.property('my-custom-key');
+      });
+    });
+    // still uncovered, tracked here rather than as empty describe.skip/it.skip stubs:
+    // - config added by an env (needs the ability to extend a specific env with new methods)
+    // - another extension asking for the component's config
+    // - conflict resolution: between two extensions, and between an extension and user overrides
+    // - extensions attempting to set protected fields (dependencies, devDeps, peerDeps, overrides,
+    //   name, main file) should be ignored
+  });
+});

@@ -1,0 +1,245 @@
+import path from 'path';
+import tempy from 'tempy';
+import fs from 'fs-extra';
+import yesno from 'yesno';
+import chalk from 'chalk';
+import { BitMap } from '@teambit/legacy.bit-map';
+import { compact } from 'lodash';
+import type { ComponentID } from '@teambit/component-id';
+import type { ScopeMain } from '@teambit/scope';
+import type { Lane } from '@teambit/objects';
+import { BitObject } from '@teambit/objects';
+import { StagedSnaps } from '@teambit/legacy.scope';
+import type { Consumer } from '@teambit/legacy.consumer';
+import { BitError } from '@teambit/bit-error';
+import type { Logger } from '@teambit/logger';
+import type { MergeAbortOpts } from './merge-abort.cmd';
+
+class PromptCanceled extends BitError {
+  constructor() {
+    super(chalk.yellow('operation aborted'));
+  }
+}
+
+const LAST_MERGED_LANE_FILENAME = 'lane';
+const LAST_MERGED_BITMAP_FILENAME = 'bitmap';
+const LAST_MERGED_MAIN_COMPONENTS_DIR = 'main-components';
+
+type Snapshot = {
+  copyOfCurrentLane?: Lane;
+  copyOfBitmap: string;
+  copyOfWorkspaceJsonc: string;
+  copyOfStagedSnaps?: string;
+  copyOfStagedConfig?: string;
+  copyOfMainComponents?: Buffer[];
+};
+
+export class LastMerged {
+  constructor(
+    private scope: ScopeMain,
+    private consumer: Consumer,
+    private logger: Logger
+  ) {}
+
+  get path() {
+    return this.scope.getLastMergedPath();
+  }
+
+  /**
+   * `idsToMerge` is needed when merging into main. a lane keeps the heads of its components in the lane object, main
+   * keeps them in the component objects, so these are copied to restore the heads the merge moves.
+   */
+  async takeSnapshot(currentLane?: Lane | null, idsToMerge: ComponentID[] = []): Promise<Snapshot> {
+    const consumer = this.consumer;
+    const copyOfCurrentLane = currentLane ? currentLane.clone() : undefined;
+    const copyOfBitmap = tempy.file();
+    const copyOfWorkspaceJsonc = tempy.file();
+    let copyOfStagedSnaps: string | undefined;
+    await fs.copyFile(consumer.bitMap.mapPath, copyOfBitmap);
+    await fs.copyFile(consumer.config.path, copyOfWorkspaceJsonc);
+    if (!consumer.scope.stagedSnaps.isEmpty()) {
+      copyOfStagedSnaps = tempy.file();
+      await fs.copyFile(StagedSnaps.getPath(consumer.scope.path), copyOfStagedSnaps);
+    }
+    const stagedConfig = await this.scope.getStagedConfig();
+    let copyOfStagedConfig: string | undefined;
+    if (!stagedConfig.isEmpty()) {
+      copyOfStagedConfig = tempy.file();
+      await fs.copyFile(stagedConfig.filePath, copyOfStagedConfig);
+    }
+    const copyOfMainComponents = currentLane ? undefined : await this.compressComponentObjects(idsToMerge);
+
+    return {
+      copyOfCurrentLane,
+      copyOfBitmap,
+      copyOfWorkspaceJsonc,
+      copyOfStagedSnaps,
+      copyOfStagedConfig,
+      copyOfMainComponents,
+    };
+  }
+
+  private async compressComponentObjects(ids: ComponentID[]): Promise<Buffer[]> {
+    const modelComponents = await Promise.all(
+      ids.map((id) => this.scope.legacyScope.getModelComponentIfExist(id.changeVersion(undefined)))
+    );
+    return Promise.all(compact(modelComponents).map((modelComponent) => modelComponent.compress()));
+  }
+
+  async persistSnapshot(snapshot: Snapshot) {
+    const { copyOfCurrentLane, copyOfBitmap, copyOfWorkspaceJsonc, copyOfStagedSnaps, copyOfStagedConfig } = snapshot;
+    await fs.remove(this.path);
+    await fs.ensureDir(this.path);
+    await fs.copyFile(copyOfBitmap, this.getLastMergedBitmapPath());
+    await fs.copyFile(copyOfWorkspaceJsonc, this.getLastMergedWorkspacePath());
+    if (copyOfCurrentLane) {
+      const compressed = await copyOfCurrentLane.compress();
+      await fs.outputFile(this.getLastMergedLanePath(), compressed);
+    }
+    if (copyOfStagedSnaps) {
+      await fs.copyFile(copyOfStagedSnaps, this.getLastMergedStagedSnapsPath());
+    }
+    if (copyOfStagedConfig) {
+      await fs.copyFile(copyOfStagedConfig, this.getLastMergedStagedConfigPath());
+    }
+    await Promise.all(
+      (snapshot.copyOfMainComponents || []).map((compressed, index) =>
+        fs.outputFile(path.join(this.getLastMergedMainComponentsPath(), String(index)), compressed)
+      )
+    );
+  }
+
+  async restoreLaneObjectFromLastMerged() {
+    if (!fs.pathExistsSync(this.path)) {
+      throw new BitError(`unable to abort the last lane-merge because "bit export" was running since then`);
+    }
+    const lastLane = await this.getLastMergedLaneContentIfExists();
+    if (!lastLane) {
+      throw new BitError(
+        `unable to revert the last lane-merge because the ${LAST_MERGED_LANE_FILENAME} is missing from ${this.path}`
+      );
+    }
+    const laneFromBackup = await BitObject.parseObject(lastLane, LAST_MERGED_LANE_FILENAME);
+    await this.scope.legacyScope.objects.writeObjectsToTheFS([laneFromBackup]);
+  }
+
+  async restoreFromLastMerged(mergeAbortOpts: MergeAbortOpts, currentLane?: Lane | null) {
+    if (!fs.pathExistsSync(this.path)) {
+      throw new BitError(`unable to abort the last lane-merge because "bit export" was running since then`);
+    }
+    const lastLane = await this.getLastMergedLaneContentIfExists();
+
+    if (!fs.pathExistsSync(this.getLastMergedBitmapPath())) {
+      throw new BitError(
+        `unable to abort the last lane-merge because the ${LAST_MERGED_BITMAP_FILENAME} is missing from ${this.path}`
+      );
+    }
+    if (!fs.pathExistsSync(this.getLastMergedWorkspacePath())) {
+      throw new BitError(
+        `unable to abort the last lane-merge because the workspace.jsonc is missing from ${this.path}`
+      );
+    }
+    if (currentLane && !lastLane) {
+      throw new BitError(
+        `unable to abort the last lane-merge because the ${LAST_MERGED_LANE_FILENAME} is missing from ${this.path}`
+      );
+    }
+    const previousBitmapBuffer = await fs.readFile(this.getLastMergedBitmapPath());
+    const previousBitmap = BitMap.loadFromContentWithoutLoadingFiles(previousBitmapBuffer, '', '', '');
+    const currentRootDirs = this.consumer.bitMap.getAllTrackDirs();
+    const previousRootDirs = previousBitmap.getAllTrackDirs();
+    const compDirsToRemove = Object.keys(currentRootDirs).filter((dir) => !previousRootDirs[dir]);
+
+    if (!mergeAbortOpts.silent) {
+      await this.mergeAbortPrompt(compDirsToRemove);
+    }
+    if (currentLane) {
+      const laneFromBackup = await BitObject.parseObject(lastLane as Buffer, LAST_MERGED_LANE_FILENAME);
+      await this.scope.legacyScope.objects.writeObjectsToTheFS([laneFromBackup]);
+    } else {
+      await this.restoreMainComponents();
+    }
+    await Promise.all(compDirsToRemove.map((dir) => fs.remove(dir))); // it doesn't throw if not-exist, so we're good here.
+    await fs.copyFile(this.getLastMergedBitmapPath(), this.consumer.bitMap.mapPath);
+    await fs.copyFile(this.getLastMergedWorkspacePath(), this.consumer.config.path);
+    if (fs.pathExistsSync(this.getLastMergedStagedSnapsPath())) {
+      await fs.copyFile(this.getLastMergedStagedSnapsPath(), StagedSnaps.getPath(this.scope.path));
+    } else {
+      await this.scope.legacyScope.stagedSnaps.deleteFile();
+    }
+    const stagedConfig = await this.scope.getStagedConfig();
+    if (fs.pathExistsSync(this.getLastMergedStagedConfigPath())) {
+      await fs.copyFile(this.getLastMergedStagedConfigPath(), stagedConfig.filePath);
+    } else {
+      await stagedConfig.deleteFile();
+    }
+    await fs.remove(this.path);
+
+    return {
+      compDirsToRemove,
+    };
+  }
+
+  private async mergeAbortPrompt(dirsToRemove: string[]) {
+    this.logger.clearStatusLine();
+    const dirsToRemoveStr = dirsToRemove.length
+      ? `\nThe following directories introduced by the merge will be deleted: ${dirsToRemove.join(', ')}`
+      : '';
+    const ok = await yesno({
+      question: `Code changes that were done since the last lane-merge will be lost.${dirsToRemoveStr}
+The .bitmap and workspace.jsonc files will be restored to the state before the merge.
+This action is irreversible.
+${chalk.bold('Do you want to continue? [yes(y)/no(n)]')}`,
+    });
+    if (!ok) {
+      throw new PromptCanceled();
+    }
+  }
+
+  /**
+   * restore the component objects as they were before merging into main, which restores their main heads.
+   */
+  private async restoreMainComponents() {
+    const dir = this.getLastMergedMainComponentsPath();
+    // a snapshot of an older bit, or of a merge with no components, has no such dir
+    const filenames: string[] = await fs.readdir(dir).catch((err) => {
+      if (err.code === 'ENOENT') return [];
+      throw err;
+    });
+    const modelComponents = await Promise.all(
+      filenames.map(async (filename) => BitObject.parseObject(await fs.readFile(path.join(dir, filename)), filename))
+    );
+    await this.scope.legacyScope.objects.writeObjectsToTheFS(modelComponents);
+  }
+
+  private async getLastMergedLaneContentIfExists(): Promise<Buffer | null> {
+    const filename = this.getLastMergedLanePath();
+    return this.getFileContentIfExist(filename);
+  }
+  private async getFileContentIfExist(filename: string): Promise<Buffer | null> {
+    try {
+      return await fs.readFile(filename);
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }
+  }
+  private getLastMergedBitmapPath() {
+    return path.join(this.path, LAST_MERGED_BITMAP_FILENAME);
+  }
+  private getLastMergedWorkspacePath() {
+    return path.join(this.path, 'workspace.jsonc');
+  }
+  private getLastMergedLanePath() {
+    return path.join(this.path, LAST_MERGED_LANE_FILENAME);
+  }
+  private getLastMergedStagedSnapsPath() {
+    return path.join(this.path, 'staged-snaps');
+  }
+  private getLastMergedStagedConfigPath() {
+    return path.join(this.path, 'staged-config.json');
+  }
+  private getLastMergedMainComponentsPath() {
+    return path.join(this.path, LAST_MERGED_MAIN_COMPONENTS_DIR);
+  }
+}

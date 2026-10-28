@@ -1,0 +1,41 @@
+{
+  "__schema": "APISchema",
+  "location": {
+    "file": "index.ts",
+    "line": 13,
+    "character": 0
+  },
+  "module": {
+    "__schema": "ModuleSchema",
+    "location": {
+      "file": "index.ts",
+      "line": 13,
+      "character": 1
+    },
+    "exports": [
+      {
+        "__schema": "VariableSchema",
+        "location": {
+          "file": "index.ts",
+          "line": 22,
+          "character": 14
+        },
+        "name": "a",
+        "signature": "const a: 4",
+        "type": {
+          "__schema": "InferenceTypeSchema",
+          "location": {
+            "file": "index.ts",
+            "line": 20,
+            "character": 13
+          },
+          "type": "4"
+        }
+      }
+    ]
+  },
+  "componentId": {
+    "name": "button",
+    "scope": "org.scope"
+  }
+}

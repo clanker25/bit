@@ -1,0 +1,63 @@
+.componentCompareCodeTreeContainer {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  height: 100%;
+  font-size: 14px;
+  // theme tokens, not white-on-dark: this panel used to assume the diff was always dark, so on a
+  // light page the filenames rendered white on white.
+  color: var(--on-surface-color, #2b2b2b);
+  background: var(--surface-color, #fff);
+}
+
+.componentCompareDrawerName {
+  &:hover {
+    border-color: var(--surface-neutral-hover-color, #f4f5f6);
+    background: var(--surface-neutral-hover-color, #f4f5f6);
+  }
+}
+.componentCompareCodeTabDrawer {
+  // drawer name
+  > div:first-child {
+    border: none;
+    border-bottom: 1px solid var(--on-surface-color, #2b2b2b);
+  }
+  height: 100%;
+}
+
+.componentCompareCodeDrawerContent {
+  overflow-y: auto;
+}
+
+.drawerIcon {
+  margin-right: 8px;
+  font-size: 14px;
+}
+
+.label {
+  font-size: 10px;
+  font-weight: unset;
+  padding: 4px;
+}
+
+.node {
+  // override default tree node selection and hover styles
+  //
+  // `--surface-primary-*` is deep purple in BOTH themes, so these rows never follow the page
+  // surface. Their label therefore has to use the on-primary foreground, otherwise on a light page
+  // it inherits the dark page foreground and renders near-black on purple.
+  &:hover {
+    background-color: var(--surface-primary-hover-color, #3a2980) !important;
+    &,
+    * {
+      color: var(--on-surface-primary-color, #fff) !important;
+    }
+  }
+  &.active {
+    background-color: var(--surface-primary-color, #140068) !important;
+    &,
+    * {
+      color: var(--on-surface-primary-color, #fff) !important;
+    }
+  }
+}

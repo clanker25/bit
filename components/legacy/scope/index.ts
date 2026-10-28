@@ -1,0 +1,62 @@
+import ComponentWithDependencies from './component-dependencies';
+import Scope from './scope';
+import loadScope from './scope-loader';
+
+export { loadScope, Scope, ComponentWithDependencies };
+export {
+  ActionNotFound,
+  BitIdCompIdError,
+  ClientIdInUse,
+  ComponentNeedsUpdate,
+  ScopeNotFound,
+  ScopeNotFoundOrDenied,
+  UnexpectedNetworkError,
+  ScopeJsonNotFound,
+  ComponentNotFound,
+  DependenciesNotFound,
+  ErrorFromRemote,
+  ExportMissingVersions,
+  HashNotFound,
+  MergeConflict,
+  MergeConflictOnRemote,
+  MissingObjects,
+  NoCommonSnap,
+  NoHeadNoVersion,
+  HashesPerRemotes,
+  VersionNotFound,
+  ParentNotFound,
+  VersionAlreadyExists,
+  IdNotFoundInGraph,
+  InvalidIndexJson,
+  OutdatedIndexJson,
+  HeadNotFound,
+  VersionNotFoundOnFS,
+  ServerIsBusy,
+  UnknownObjectType,
+  PersistFailed,
+  VersionInvalid,
+  LaneNotFound,
+  UnexpectedPackageName,
+} from './exceptions';
+export type { FETCH_TYPE, FETCH_OPTIONS } from './objects-fetcher/fetch-options';
+export { validateType } from '@teambit/legacy.cli.error';
+export { listLocalScope, ListScopeResult } from './list-local-scope';
+export { importMultipleDistsArtifacts, importAllArtifactsFromLane } from './component-ops/import-artifacts';
+export { RemovedObjects, RemovedObjectSerialized } from './removed-components';
+export { ComponentObjects } from './component-objects';
+export { LaneData, serializeLaneData } from './lanes/lanes';
+export { UnmergedComponents } from './lanes/unmerged-components';
+export { Tmp } from './repositories';
+export { UnmergedComponent, UNMERGED_FILENAME } from './lanes/unmerged-components';
+export { TrackLane, ScopeJson } from './scope-json';
+export { StagedSnaps } from './staged-snaps';
+export { ComponentVersion } from './component-version';
+export { validateVersionInstance } from './version-validator';
+export { typesObj, typesToObject, Types } from './object-registrar';
+export { GarbageCollectorOpts, ScopeDescriptor } from './scope';
+export { DELETED_OBJECTS_DIR } from './garbage-collector';
+export { loadScopeIfExist } from './scope-loader';
+export { ScopeComponentsImporter, errorIsTypeOfMissingObject } from './component-ops/scope-components-importer';
+export { multipleVersionDependenciesToConsumer, VersionDependencies } from './version-dependencies';
+export { MergeResult } from './repositories/sources';
+export { RemoteLanes } from './lanes/remote-lanes';

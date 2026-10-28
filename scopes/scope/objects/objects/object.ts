@@ -1,0 +1,208 @@
+import { constants, inflateSync } from 'zlib';
+
+import { NULL_BYTE, SPACE_DELIMITER } from '@teambit/legacy.constants';
+import { deflate, inflate } from '@teambit/legacy.utils';
+import { sha1 } from '@teambit/toolbox.crypto.sha1';
+import { UnknownObjectType, typesObj as types } from '@teambit/legacy.scope';
+import type { ObjectItem } from './object-list';
+import Ref from './ref';
+import type Repository from './repository';
+
+function parse(buffer: Buffer): BitObject {
+  const { type, hash, contents } = extractHeaderAndContent(buffer);
+  if (!types[type]) throw new UnknownObjectType(type);
+  return types[type].parse(contents, hash);
+}
+
+function extractHeaderAndContent(buffer: Buffer): { type: string; hash: string; contents: Buffer } {
+  const firstNullByteLocation = buffer.indexOf(NULL_BYTE);
+  const headers = buffer.slice(0, firstNullByteLocation).toString();
+  const [type, hash] = headers.split(SPACE_DELIMITER);
+  const contents = buffer.slice(firstNullByteLocation + 1, buffer.length);
+  return { type, hash, contents };
+}
+
+export default class BitObject {
+  validateBeforePersist = true; // validate the object before persisting
+  id(): string | Buffer {
+    throw new Error('id() was not implemented...');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  toBuffer(pretty?: boolean): Buffer {
+    throw new Error('toBuffer() was not implemented...');
+  }
+
+  refs(): Ref[] {
+    return [];
+  }
+
+  getType(): string {
+    return this.constructor.name;
+  }
+
+  getHeader(buffer: Buffer): string {
+    return `${this.getType()} ${this.hash().toString()} ${buffer.toString().length}${NULL_BYTE}`;
+  }
+
+  async collectRefs(repo: Repository): Promise<Ref[]> {
+    const refsCollection: Ref[] = [];
+    const objectType = this.getType();
+    const objectId = objectType === 'Component' ? `Component ${this.id()}` : objectType;
+
+    async function addRefs(object: BitObject) {
+      const refs = object.refs();
+      let objs;
+      try {
+        objs = await Promise.all(refs.map((ref) => ref.load(repo, true)));
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          throw new Error(`failed finding an object file required by ${object.constructor.name} object, originated from ${objectId}
+path: ${err.path}`);
+        }
+        throw err;
+      }
+
+      refsCollection.push(...refs);
+      await Promise.all(objs.map((obj) => addRefs(obj)));
+    }
+
+    await addRefs(this);
+    return refsCollection;
+  }
+
+  async collectRaw(repo: Repository): Promise<ObjectItem[]> {
+    const refs = await this.collectRefs(repo);
+    return repo.loadManyRaw(refs);
+  }
+
+  asRaw(repo: Repository): Promise<Buffer> {
+    return repo.loadRaw(this.hash());
+  }
+
+  collect(repo: Repository): BitObject[] {
+    const objects: BitObject[] = [];
+
+    function addRefs(object: BitObject) {
+      const objs = object.refs().map((ref) => {
+        return ref.loadSync(repo);
+      });
+
+      objects.push(...objs);
+      objs.forEach((obj) => addRefs(obj));
+    }
+
+    addRefs(this);
+    return objects;
+  }
+
+  /**
+   * indexing method
+   */
+  hash(): Ref {
+    // console.log(`sha ${sha1(this.id())}, id ${this.id()}`); // uncomment when debugging hash issues
+    return new Ref(BitObject.makeHash(this.id()));
+  }
+
+  async compress(): Promise<Buffer> {
+    return (await this.compressWithSize()).buffer;
+  }
+
+  /**
+   * same as `compress`, but also returns the size of the uncompressed content.
+   */
+  async compressWithSize(): Promise<{ buffer: Buffer; inflatedSize: number }> {
+    const serialized = this.serialize();
+    return { buffer: await deflate(serialized), inflatedSize: serialized.byteLength };
+  }
+
+  serialize(): Buffer {
+    const buffer = this.toBuffer();
+    return Buffer.concat([Buffer.from(this.getHeader(buffer)), buffer] as unknown as Uint8Array[]);
+  }
+
+  /**
+   * see `this.parseSync` for the sync version
+   */
+  static async parseObject(fileContents: Buffer, filePath?: string): Promise<BitObject> {
+    return (await BitObject.parseObjectWithSize(fileContents, filePath)).object;
+  }
+
+  /**
+   * same as `parseObject`, but also returns the size of the inflated content.
+   */
+  static async parseObjectWithSize(
+    fileContents: Buffer,
+    filePath?: string
+  ): Promise<{ object: BitObject; inflatedSize: number }> {
+    const buffer = await inflate(fileContents, filePath);
+    return { object: parse(buffer), inflatedSize: buffer.byteLength };
+  }
+
+  /**
+   * same as `parseObject`, however, if the type is not one of the given "typeNames", it returns null.
+   * the performance improvement is huge compare to "parseObject", as it doesn't parse the object if not needed.
+   */
+  static async parseObjectOnlyIfType(
+    fileContents: Buffer,
+    typeNames: string[],
+    filePath?: string
+  ): Promise<BitObject | null> {
+    const buffer = await inflate(fileContents, filePath);
+    const { type } = extractHeaderAndContent(buffer);
+    if (typeNames.includes(type)) return parse(buffer);
+    return null;
+  }
+
+  /**
+   * extract only the object type out of the first chunk of a compressed object file.
+   *
+   * the type is the first token of the header, which sits at the very beginning of the inflated
+   * buffer, so there's no need to inflate the entire object. `Z_SYNC_FLUSH` tells zlib to return
+   * whatever it managed to inflate instead of throwing on the truncated input.
+   * returns null when the header is not fully contained in the given chunk, in which case the
+   * caller should fall back to inflating the whole file. a header that is there but names a type
+   * nothing is registered under throws instead: reading it as a type of its own would let a
+   * damaged object pass for classified, and the caller acts on the inventory being complete.
+   *
+   * the chunk is a `Uint8Array` rather than a `Buffer` because newer `@types/node` make `Buffer`
+   * generic, which no longer matches zlib's `InputType` under the typescript version our envs ship.
+   */
+  static parseObjectTypeFromChunk(chunk: Uint8Array): string | null {
+    let buffer: Buffer;
+    try {
+      buffer = inflateSync(chunk, { finishFlush: constants.Z_SYNC_FLUSH });
+    } catch {
+      return null;
+    }
+    const firstNullByteLocation = buffer.indexOf(NULL_BYTE);
+    if (firstNullByteLocation === -1) return null;
+    const [type] = buffer.slice(0, firstNullByteLocation).toString().split(SPACE_DELIMITER);
+    if (!type) return null;
+    if (!types[type]) throw new UnknownObjectType(type);
+    return type;
+  }
+
+  /**
+   * same as `parseObjectTypeFromChunk`, only it gets the entire (inflated) object.
+   */
+  static async parseObjectType(fileContents: Buffer, filePath?: string): Promise<string> {
+    const buffer = await inflate(fileContents, filePath);
+    const { type } = extractHeaderAndContent(buffer);
+    if (!types[type]) throw new UnknownObjectType(type);
+    return type;
+  }
+
+  /**
+   * prefer using `this.parseObject()`, unless it must be sync.
+   */
+  static parseSync(fileContents: Buffer): BitObject {
+    // @ts-ignore todo: fix after merging #9359
+    const buffer = inflateSync(fileContents);
+    return parse(buffer);
+  }
+
+  static makeHash(str: string | Buffer): string {
+    return sha1(str);
+  }
+}

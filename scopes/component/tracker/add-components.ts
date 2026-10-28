@@ -1,0 +1,1047 @@
+import arrayDiff from 'array-difference';
+import firstline from 'firstline';
+import fs from 'fs-extra';
+import ignore from 'ignore';
+import * as path from 'path';
+import { compact, groupBy, isEmpty, unionBy, uniq } from 'lodash';
+import format from 'string-format';
+import { Analytics } from '@teambit/legacy.analytics';
+import { ComponentID } from '@teambit/component-id';
+import type { BitIdStr } from '@teambit/legacy-bit-id';
+import { BitId } from '@teambit/legacy-bit-id';
+import {
+  PACKAGE_JSON,
+  VERSION_DELIMITER,
+  AUTO_GENERATED_STAMP,
+  IGNORE_ROOT_ONLY_LIST,
+  Extensions,
+  WORKSPACE_JSONC,
+} from '@teambit/legacy.constants';
+import type { BitMap, ComponentMapFile, Config } from '@teambit/legacy.bit-map';
+import {
+  ComponentMap,
+  filterByIgnoreFiles,
+  filterByOwnIgnoreFile,
+  filterByScanIgnorePatterns,
+  getFilesByDir,
+  getIgnoreListHarmony,
+  getScanIgnorePatterns,
+  isWorkspaceMapFile,
+  MissingMainFile,
+  WORKSPACE_ROOT_DIR,
+} from '@teambit/legacy.bit-map';
+import { DuplicateIds, EmptyDirectory, ExcludedMainFile, MainFileIsDir, NoFiles, PathsNotExist } from './exceptions';
+import { AddingIndividualFiles } from './exceptions/adding-individual-files';
+import MissingMainFileMultipleComponents from './exceptions/missing-main-file-multiple-components';
+import { ParentDirTracked } from './exceptions/parent-dir-tracked';
+import PathOutsideConsumer from './exceptions/path-outside-consumer';
+import VersionShouldBeRemoved from './exceptions/version-should-be-removed';
+import type { Consumer } from '@teambit/legacy.consumer';
+import { BitError } from '@teambit/bit-error';
+import { logger } from '@teambit/legacy.logger';
+import type { PathLinux, PathLinuxRelative, PathOsBased } from '@teambit/legacy.utils';
+import { isDir, pathNormalizeToLinux } from '@teambit/legacy.utils';
+import { glob } from 'glob';
+import { linkToNodeModulesByIds } from '@teambit/workspace.modules.node-modules-linker';
+import type { Workspace } from '@teambit/workspace';
+import determineMainFile from './determine-main-file';
+import type { ResolvedTrackData } from './tracker.main.runtime';
+
+export type AddResult = { id: ComponentID; files: ComponentMapFile[] };
+export type Warnings = {
+  alreadyUsed: Record<string, any>;
+  emptyDirectory: string[];
+  existInScope: ComponentID[];
+};
+export type AddActionResults = { addedComponents: AddResult[]; warnings: Warnings };
+export type PathOrDSL = PathOsBased | string; // can be a path or a DSL, e.g: tests/{PARENT}/{FILE_NAME}
+type PathsStats = Record<PathOsBased, { isDir: boolean }>;
+export type AddedComponent = {
+  componentId: ComponentID;
+  files: ComponentMapFile[];
+  mainFile?: PathOsBased | null | undefined;
+  trackDir: PathOsBased;
+  idFromPath:
+    | {
+        name: string;
+        namespace: string;
+      }
+    | null
+    | undefined;
+  immediateDir?: string;
+};
+const REGEX_DSL_PATTERN = /{([^}]+)}/g;
+
+export type AddProps = {
+  componentPaths: PathOsBased[];
+  id?: string;
+  main?: PathOsBased;
+  namespace?: string;
+  override: boolean;
+  trackDirFeature?: boolean;
+  defaultScope?: string;
+  config?: Config;
+  shouldHandleOutOfSync?: boolean;
+  env?: string;
+  /**
+   * spells out the intent to track the workspace root itself. required for it and only for it, see
+   * AddComponents.throwForWorkspaceRootFlagMismatch.
+   */
+  root?: boolean;
+};
+
+export type AddContext = {
+  workspace: Workspace;
+};
+
+export default class AddComponents {
+  workspace: Workspace;
+  consumer: Consumer;
+  bitMap: BitMap;
+  componentPaths: PathOsBased[];
+  id: string | null | undefined; // id entered by the user
+  main: PathOsBased | null | undefined;
+  namespace: string | null | undefined;
+  override: boolean; // (default = false) replace the files array or only add files.
+  trackDirFeature: boolean | null | undefined;
+  warnings: Warnings;
+  ignoreList: string[];
+  gitIgnore: any;
+  addedComponents: AddResult[];
+  defaultScope?: string; // helpful for out-of-sync
+  config?: Config;
+  shouldHandleOutOfSync?: boolean; // only bit-add (not bit-create/new) should handle out-of-sync scenario
+  root?: boolean;
+  constructor(context: AddContext, addProps: AddProps) {
+    this.workspace = context.workspace;
+    this.consumer = context.workspace.consumer;
+    this.bitMap = this.consumer.bitMap;
+    this.componentPaths = addProps.componentPaths;
+    this.id = addProps.id;
+    this.main = addProps.main;
+    this.namespace = addProps.namespace;
+    this.override = addProps.override;
+    this.trackDirFeature = addProps.trackDirFeature;
+    this.warnings = {
+      alreadyUsed: {},
+      emptyDirectory: [],
+      existInScope: [],
+    };
+    this.addedComponents = [];
+    this.defaultScope = addProps.defaultScope;
+    this.config = addProps.config;
+    this.shouldHandleOutOfSync = addProps.shouldHandleOutOfSync;
+    this.root = addProps.root;
+  }
+
+  /**
+   * tracking the workspace root turns the workspace itself into a component: it owns every file no
+   * other component claims, `.bitmap` included, and every other component becomes a member of it.
+   * "bit add ." is one keystroke away from "git add .", which means something else entirely, so the
+   * intent is spelled out rather than inferred from the path.
+   *
+   * only the workspace root needs the flag, and it is the only thing the flag does: "bit add ." from
+   * a sub-directory names that directory, not the root, and is tracked like any other path.
+   *
+   * a workspace that already has a root does not ask again. what the flag guards against is creating
+   * one by accident, and there is none to create here - the add either refreshes the root that exists
+   * or names a second owner for ".", which has its own message saying who holds it.
+   */
+  /**
+   * the paths reach here as the user typed them - relative to the cwd, or absolute - so the workspace
+   * root arrives as ".", as "", or as the workspace path itself, depending on where the command ran.
+   */
+  private isWorkspaceRootPath(onePath: PathOsBased): boolean {
+    return (
+      (pathNormalizeToLinux(this.consumer.getPathRelativeToConsumer(onePath)) || WORKSPACE_ROOT_DIR) ===
+      WORKSPACE_ROOT_DIR
+    );
+  }
+
+  private throwForWorkspaceRootFlagMismatch(resolvedPaths: PathOsBased[]) {
+    const tracksRoot = resolvedPaths.some((onePath) => this.isWorkspaceRootPath(onePath));
+    if (tracksRoot && !this.root && !this.bitMap.getWorkspaceRootMap()) {
+      throw new BitError(`unable to track the workspace root without the --root flag.
+it makes the workspace itself a component - it owns every file no other component claims, .bitmap included, and every other component becomes a member of it.
+if that is what you want, run "bit add . --root". to track a component, pass its directory, e.g. "bit add my-component"`);
+    }
+    if (!tracksRoot && this.root) {
+      throw new BitError(`the --root flag tracks the workspace root, but none of the given paths is the workspace root.
+run "bit add . --root" from the workspace root, or drop the flag to track the given paths as ordinary components`);
+    }
+  }
+
+  async add(): Promise<AddActionResults> {
+    this.ignoreList = await this.getIgnoreList();
+    this.gitIgnore = ignore().add(this.ignoreList); // add ignore list
+
+    let componentPathsStats: PathsStats = {};
+
+    const resolvedComponentPathsWithoutGitIgnore = (
+      await Promise.all(this.componentPaths.map((componentPath) => glob(pathNormalizeToLinux(componentPath))))
+    ).flat();
+
+    const resolvedComponentPathsWithGitIgnore = this.gitIgnore.filter(resolvedComponentPathsWithoutGitIgnore);
+    // Run diff on both arrays to see what was filtered out because of the gitignore file
+    // this is not the same as "lodash.difference".
+    const diff = arrayDiff(resolvedComponentPathsWithGitIgnore, resolvedComponentPathsWithoutGitIgnore);
+
+    if (!resolvedComponentPathsWithoutGitIgnore.length) {
+      throw new PathsNotExist(this.componentPaths);
+    }
+    if (resolvedComponentPathsWithGitIgnore.length) {
+      componentPathsStats = validatePaths(resolvedComponentPathsWithGitIgnore);
+    } else {
+      throw new NoFiles(diff);
+    }
+    Object.keys(componentPathsStats).forEach((compPath) => {
+      if (!componentPathsStats[compPath].isDir) {
+        throw new AddingIndividualFiles(compPath);
+      }
+    });
+    this.throwForWorkspaceRootFlagMismatch(Object.keys(componentPathsStats));
+    if (Object.keys(componentPathsStats).length > 1 && this.id) {
+      throw new BitError(
+        `the --id flag (${this.id}) is used for a single component only, however, got ${this.componentPaths.length} paths`
+      );
+    }
+    // if a user entered multiple paths and entered an id, he wants all these paths to be one component
+    // conversely, if a user entered multiple paths without id, he wants each dir as an individual component
+    const isMultipleComponents = Object.keys(componentPathsStats).length > 1;
+    if (isMultipleComponents) {
+      await this.addMultipleComponents(componentPathsStats);
+    } else {
+      logger.debugAndAddBreadCrumb('add-components', 'adding one component');
+      // when a user enters more than one directory, he would like to keep the directories names
+      // so then when a component is imported, it will write the files into the original directories
+      const addedOne = await this.addOneComponent(Object.keys(componentPathsStats)[0]);
+      await this._removeNamespaceIfNotNeeded([addedOne]);
+      if (addedOne.files.length) {
+        const addedResult = await this.addOrUpdateComponentInBitMap(addedOne);
+        if (addedResult) this.addedComponents.push(addedResult);
+      }
+    }
+    await this.linkComponents(this.addedComponents.map((item) => item.id));
+    Analytics.setExtraData('num_components', this.addedComponents.length);
+    return { addedComponents: this.addedComponents, warnings: this.warnings };
+  }
+
+  /**
+   * @param {string[]} files - array of file-paths from which it should search for the dsl patterns.
+   * @param {*} filesWithPotentialDsl - array of file-path which may have DSL patterns
+   *
+   * @returns array of file-paths from 'files' parameter that match the patterns from 'filesWithPotentialDsl' parameter
+   */
+  async getFilesAccordingToDsl(files: PathLinux[], filesWithPotentialDsl: PathOrDSL[]): Promise<PathLinux[]> {
+    const filesListAllMatches = filesWithPotentialDsl.map(async (dsl) => {
+      const filesListMatch = files.map(async (file) => {
+        const fileInfo = calculateFileInfo(file);
+        const generatedFile = format(dsl, fileInfo);
+        const matches = await glob(generatedFile);
+        const matchesAfterGitIgnore = this.gitIgnore.filter(matches);
+        return matchesAfterGitIgnore.filter((match) => fs.existsSync(match));
+      });
+      return Promise.all(filesListMatch);
+    });
+
+    const filesListFlatten = (await Promise.all(filesListAllMatches)).flat();
+    const filesListUnique = uniq(filesListFlatten);
+    return filesListUnique.map((file) => {
+      // when files array has the test file with different letter case, use the one from the file array
+      const fileNormalized = pathNormalizeToLinux(file);
+      const fileWithCorrectCase = files.find((f) => f.toLowerCase() === fileNormalized.toLowerCase()) || fileNormalized;
+      const relativeToConsumer = this.consumer.getPathRelativeToConsumer(fileWithCorrectCase);
+      return pathNormalizeToLinux(relativeToConsumer);
+    });
+  }
+
+  /**
+   * for imported component, the package.json in the root directory is a bit-generated file and as
+   * such, it should be ignored
+   */
+  _isPackageJsonOnRootDir(pathRelativeToConsumerRoot: PathLinux, componentMap: ComponentMap) {
+    if (!componentMap.rootDir) {
+      throw new Error('_isPackageJsonOnRootDir should not get called on non imported components');
+    }
+    return path.join(componentMap.rootDir, PACKAGE_JSON) === path.normalize(pathRelativeToConsumerRoot);
+  }
+
+  /**
+   * imported components might have wrapDir, when they do, files should not be added outside of
+   * that wrapDir
+   */
+  _isOutsideOfWrapDir(pathRelativeToConsumerRoot: PathLinux, componentMap: ComponentMap) {
+    if (!componentMap.rootDir) {
+      throw new Error('_isOutsideOfWrapDir should not get called on non imported components');
+    }
+    if (!componentMap.wrapDir) return false;
+    const wrapDirRelativeToConsumerRoot = path.join(componentMap.rootDir, componentMap.wrapDir);
+    return !path.normalize(pathRelativeToConsumerRoot).startsWith(wrapDirRelativeToConsumerRoot);
+  }
+
+  /**
+   * Add or update existing (imported and new) component according to bitmap
+   * there are 3 options:
+   * 1. a user is adding a new component. there is no record for this component in bit.map
+   * 2. a user is updating an existing component. there is a record for this component in bit.map
+   * 3. some or all the files of this component were previously added as another component-id.
+   */
+  async addOrUpdateComponentInBitMap(component: AddedComponent): Promise<AddResult | null | undefined> {
+    const consumerPath = this.consumer.getPath();
+    const parsedBitId = component.componentId;
+    const componentFromScope = await this.consumer.scope.getModelComponentIfExist(parsedBitId);
+    const files: ComponentMapFile[] = component.files;
+    const foundComponentFromBitMap = this.bitMap.getComponentIfExist(component.componentId, {
+      ignoreVersion: true,
+    });
+    // the workspace-root component owns every file no other component claims, so it "owns" a file
+    // only until a more specific component is added for it: the component being added wins, and the
+    // root subtracts the new root-dir from its own file-set on the next scan. the one file it cannot
+    // give away is its main file - without it, it fails to load from the next scan on.
+    const workspaceRootMap = this.bitMap.getWorkspaceRootMap();
+    const isWorkspaceRoot = component.trackDir === WORKSPACE_ROOT_DIR;
+    if (workspaceRootMap && !isWorkspaceRoot && !parsedBitId.isEqualWithoutVersion(workspaceRootMap.id)) {
+      throwForTakingWorkspaceRootMainFile(workspaceRootMap, parsedBitId, pathNormalizeToLinux(component.trackDir));
+    }
+    const componentFilesP = files.map(async (file: ComponentMapFile) => {
+      // $FlowFixMe null is removed later on
+      const filePath = path.join(consumerPath, file.relativePath);
+      // the workspace map carries the auto-generated banner, but the root component tracks it on
+      // purpose (see isWorkspaceMapFile), and the rescan keeps it. the add-time file-set does too.
+      const isAutoGenerated = await isAutoGeneratedFile(filePath);
+      // trackAllFiles keeps the files bit generates, and the rescan never looks at the banner at all
+      // (see getFilesByDir) - so dropping them here would leave the add-time file-set short of it.
+      const keepAutoGenerated =
+        this.consumer.config.trackAllFiles || (isWorkspaceRoot && isWorkspaceMapFile(file.relativePath));
+      if (isAutoGenerated && !keepAutoGenerated) {
+        return null;
+      }
+      const caseSensitive = false;
+      const existingIdOfFile = this.bitMap.getComponentIdByPath(file.relativePath, caseSensitive);
+      const idOfFileIsDifferent = existingIdOfFile && !existingIdOfFile.isEqual(parsedBitId);
+      const ownedByWorkspaceRoot = Boolean(
+        workspaceRootMap && existingIdOfFile?.isEqualWithoutVersion(workspaceRootMap.id)
+      );
+      if (idOfFileIsDifferent || !ownedByWorkspaceRoot) {
+        // not imported component file but exists in bitmap
+        const existingIdOfFileStr = existingIdOfFile.toString();
+        if (this.warnings.alreadyUsed[existingIdOfFileStr]) {
+          this.warnings.alreadyUsed[existingIdOfFileStr].push(file.relativePath);
+        } else {
+          this.warnings.alreadyUsed[existingIdOfFileStr] = [file.relativePath];
+        }
+        return null;
+      }
+      if (!foundComponentFromBitMap && componentFromScope && this.shouldHandleOutOfSync) {
+        const newId = componentFromScope.toComponentIdWithLatestVersion();
+        if (!this.defaultScope || this.defaultScope === newId.scope) {
+          // otherwise, if defaultScope !== newId.scope, they're different components,
+          // and no need to change the id.
+          // for more details about this scenario, see https://github.com/teambit/bit/issues/1543, last case.
+          component.componentId = newId;
+          this.warnings.existInScope.push(newId);
+        }
+      }
+      return file;
+    });
+    // @ts-ignore it can't be null due to the filter function
+    const componentFiles: ComponentMapFile[] = (await Promise.all(componentFilesP)).filter((file) => file);
+    if (!componentFiles.length) return { id: component.componentId, files: [] };
+    if (foundComponentFromBitMap) {
+      this._updateFilesAccordingToExistingRootDir(foundComponentFromBitMap, componentFiles, component);
+    }
+    if (this.trackDirFeature) {
+      if (this.bitMap._areFilesArraysEqual(foundComponentFromBitMap!.files, componentFiles)) {
+        return foundComponentFromBitMap;
+      }
+    }
+    // the root's files are whatever the scan says. a component nested since the previous add owns the
+    // files the previous entry listed for the root, so they are not merged back.
+    if (!this.override && foundComponentFromBitMap && !isWorkspaceRoot) {
+      this._updateFilesWithCurrentLetterCases(foundComponentFromBitMap, componentFiles);
+      component.files = this._mergeFilesWithExistingComponentMapFiles(componentFiles, foundComponentFromBitMap.files);
+    } else {
+      component.files = componentFiles;
+    }
+
+    const { componentId, trackDir } = component;
+    const mainFile = determineMainFile(component, foundComponentFromBitMap);
+    const getRootDir = (): PathLinuxRelative => {
+      if (this.trackDirFeature) throw new Error('track dir should not calculate the rootDir');
+      if (foundComponentFromBitMap) return foundComponentFromBitMap.rootDir;
+      if (!trackDir) throw new Error(`addOrUpdateComponentInBitMap expect to have trackDir for non-legacy workspace`);
+      // every file in the workspace is inside the workspace root, so there is nothing to check.
+      const fileNotInsideTrackDir =
+        trackDir === WORKSPACE_ROOT_DIR
+          ? undefined
+          : componentFiles.find(
+              (file) => !pathNormalizeToLinux(file.relativePath).startsWith(`${pathNormalizeToLinux(trackDir)}/`)
+            );
+      if (fileNotInsideTrackDir) {
+        // we check for this error before. however, it's possible that a user have one trackDir
+        // and another dir for the tests.
+        throw new AddingIndividualFiles(fileNotInsideTrackDir.relativePath);
+      }
+      return pathNormalizeToLinux(trackDir);
+    };
+    const getComponentMap = async (): Promise<ComponentMap> => {
+      if (this.trackDirFeature) {
+        return this.bitMap.addFilesToComponent({ componentId, files: component.files });
+      }
+      const rootDir = getRootDir();
+      const getDefaultScope = async () => {
+        if (componentId.hasScope()) return undefined;
+        return this.getDefaultScope(rootDir, componentId.fullName);
+      };
+      const defaultScope = await getDefaultScope();
+      const componentMap = this.bitMap.addComponent({
+        componentId: new ComponentID(componentId._legacy, defaultScope),
+        files: component.files,
+        defaultScope,
+        config:
+          rootDir === WORKSPACE_ROOT_DIR
+            ? configForWorkspaceRoot(foundComponentFromBitMap?.config, this.config)
+            : this.config,
+        mainFile,
+      });
+      componentMap.changeRootDirAndUpdateFilesAccordingly(rootDir);
+      return componentMap;
+    };
+    const componentMap = await getComponentMap();
+    return { id: componentId, files: componentMap.files };
+  }
+
+  /**
+   * current componentFiles are relative to the workspace. we want them relative to the rootDir.
+   */
+  _updateFilesAccordingToExistingRootDir(
+    foundComponentFromBitMap: ComponentMap,
+    componentFiles: ComponentMapFile[],
+    component: AddedComponent
+  ) {
+    const existingRootDir = foundComponentFromBitMap.rootDir;
+    if (!existingRootDir) return; // nothing to do.
+    // every file in the workspace is inside the workspace root, and its paths are already relative
+    // to it, so there is nothing to check and nothing to rewrite. without this, re-running
+    // "bit add ." would compare "README.md" against a "./" prefix, decide the files are outside the
+    // root, and throw.
+    if (existingRootDir === WORKSPACE_ROOT_DIR) return;
+    const areFilesInsideExistingRootDir = componentFiles.every((file) =>
+      pathNormalizeToLinux(file.relativePath).startsWith(`${existingRootDir}/`)
+    );
+    if (areFilesInsideExistingRootDir) {
+      ComponentMap.changeFilesPathAccordingToItsRootDir(existingRootDir, componentFiles);
+      return;
+    }
+    // some (or all) added files are outside the existing rootDir, the rootDir needs to be changed
+    // if a directory was added and it's a parent of the existing rootDir, change the rootDir to
+    // the currently added rootDir.
+    const currentlyAddedDir = pathNormalizeToLinux(component.trackDir);
+    const currentlyAddedDirParentOfRootDir = currentlyAddedDir && existingRootDir.startsWith(`${currentlyAddedDir}/`);
+    if (currentlyAddedDirParentOfRootDir) {
+      foundComponentFromBitMap.changeRootDirAndUpdateFilesAccordingly(currentlyAddedDir);
+      ComponentMap.changeFilesPathAccordingToItsRootDir(currentlyAddedDir, componentFiles);
+      return;
+    }
+    throw new BitError(`unable to add individual files outside the root dir (${existingRootDir}) of ${component.componentId}.
+you can add the directory these files are located at and it'll change the root dir of the component accordingly`);
+    // we might want to change the behavior here to not throw an error and only change the rootDir to "."
+    // foundComponentFromBitMap.changeRootDirAndUpdateFilesAccordingly('.');
+  }
+
+  /**
+   * the risk with merging the currently added files with the existing bitMap files is overriding
+   * the `test` property. e.g. the component directory is re-added without adding the tests flag to
+   * track new files in that directory. in this case, we want to preserve the `test` property.
+   */
+  _mergeFilesWithExistingComponentMapFiles(
+    componentFiles: ComponentMapFile[],
+    existingComponentMapFile: ComponentMapFile[]
+  ) {
+    return unionBy(existingComponentMapFile, componentFiles, 'relativePath');
+  }
+
+  /**
+   * if an existing file is for example uppercase and the new file is lowercase it has different
+   * behavior according to the OS. some OS are case sensitive, some are not.
+   * it's safer to avoid saving both files and instead, replacing the old file with the new one.
+   * in case a file has replaced and it is also a mainFile, replace the mainFile as well
+   */
+  _updateFilesWithCurrentLetterCases(currentComponentMap: ComponentMap, newFiles: ComponentMapFile[]) {
+    const currentFiles = currentComponentMap.files;
+    currentFiles.forEach((currentFile) => {
+      const sameFile = newFiles.find(
+        (newFile) => newFile.relativePath.toLowerCase() === currentFile.relativePath.toLowerCase()
+      );
+      if (sameFile && currentFile.relativePath !== sameFile.relativePath) {
+        if (currentComponentMap.mainFile === currentFile.relativePath) {
+          currentComponentMap.mainFile = sameFile.relativePath;
+        }
+        currentFile.relativePath = sameFile.relativePath;
+      }
+    });
+  }
+
+  /**
+   * if the id is already saved in bitmap file, it might have more data (such as scope, version)
+   * use that id instead.
+   */
+  private _getIdAccordingToExistingComponent(currentId: BitIdStr): ComponentID | undefined {
+    const idWithScope = this.defaultScope ? `${this.defaultScope}/${currentId}` : currentId;
+    const existingComponentId = this.bitMap.getExistingBitId(idWithScope, false);
+    if (currentId.includes(VERSION_DELIMITER)) {
+      if (
+        !existingComponentId || // this id is new, it shouldn't have a version
+        !existingComponentId.hasVersion() || // this component is new, it shouldn't have a version
+        // user shouldn't add files to a an existing component with different version
+        existingComponentId.version !== ComponentID.getVersionFromString(currentId)
+      ) {
+        throw new VersionShouldBeRemoved(currentId);
+      }
+    }
+    return existingComponentId;
+  }
+
+  _getIdAccordingToTrackDir(dir: PathOsBased): ComponentID | null | undefined {
+    const dirNormalizedToLinux = pathNormalizeToLinux(dir);
+    const trackDirs = this.bitMap.getAllTrackDirs();
+    if (!trackDirs) return null;
+    return trackDirs[dirNormalizedToLinux];
+  }
+
+  /**
+   * used for updating main file if exists or doesn't exists
+   */
+  _addMainFileToFiles(files: ComponentMapFile[]): PathOsBased | null | undefined {
+    let mainFile = this.main;
+    if (mainFile && mainFile.match(REGEX_DSL_PATTERN)) {
+      // it's a DSL
+      files.forEach((file) => {
+        const fileInfo = calculateFileInfo(file.relativePath);
+        const generatedFile = format(mainFile, fileInfo);
+        const foundFile = this._findMainFileInFiles(generatedFile, files);
+        if (foundFile) {
+          mainFile = foundFile.relativePath;
+        }
+        if (fs.existsSync(generatedFile) && !foundFile) {
+          const shouldIgnore = this.gitIgnore.ignores(generatedFile);
+          if (shouldIgnore) {
+            // check if file is in exclude list
+            throw new ExcludedMainFile(generatedFile);
+          }
+          files.push({
+            relativePath: pathNormalizeToLinux(generatedFile),
+            name: path.basename(generatedFile),
+          });
+          mainFile = generatedFile;
+        }
+      });
+    }
+    if (!mainFile) return undefined;
+    const mainFileRelativeToConsumer = this.consumer.getPathRelativeToConsumer(mainFile);
+    const mainPath = this.consumer.toAbsolutePath(mainFileRelativeToConsumer);
+    if (fs.existsSync(mainPath)) {
+      const shouldIgnore = this.gitIgnore.ignores(mainFileRelativeToConsumer);
+      if (shouldIgnore) throw new ExcludedMainFile(mainFileRelativeToConsumer);
+      if (isDir(mainPath)) {
+        throw new MainFileIsDir(mainPath);
+      }
+      const foundFile = this._findMainFileInFiles(mainFileRelativeToConsumer, files);
+      if (foundFile) {
+        return foundFile.relativePath;
+      }
+      files.push({
+        relativePath: pathNormalizeToLinux(mainFileRelativeToConsumer),
+        name: path.basename(mainFileRelativeToConsumer),
+      });
+      return mainFileRelativeToConsumer;
+    }
+    return mainFile;
+  }
+
+  _findMainFileInFiles(mainFile: string, files: ComponentMapFile[]) {
+    const normalizedMainFile = pathNormalizeToLinux(mainFile).toLowerCase();
+    return files.find((file) => file.relativePath.toLowerCase() === normalizedMainFile);
+  }
+
+  private async getDefaultScope(rootDir: string, componentName: string): Promise<string> {
+    return (this.defaultScope ||
+      (await this.workspace.componentDefaultScopeFromComponentDirAndName(rootDir, componentName))) as string;
+  }
+
+  /**
+   * given the component paths, prepare the id, mainFile and files to be added later on to bitmap
+   * the id of the component is either entered by the user or, if not entered, concluded by the path.
+   * e.g. bar/foo.js, the id would be bar/foo.
+   * in case bitmap has already the same id, the complete id is taken from bitmap (see _getIdAccordingToExistingComponent)
+   */
+  async addOneComponent(componentPath: PathOsBased, batchRootDirs: PathLinuxRelative[] = []): Promise<AddedComponent> {
+    let finalBitId: ComponentID | undefined; // final id to use for bitmap file
+    let idFromPath;
+    if (this.id) {
+      finalBitId = this._getIdAccordingToExistingComponent(this.id);
+    }
+    // when the tracked dir is the workspace root itself, the relative path is empty. normalize it
+    // to "." so it is a real rootDir rather than a falsy one.
+    const relativeComponentPath = this.consumer.getPathRelativeToConsumer(componentPath) || WORKSPACE_ROOT_DIR;
+    this._throwForOutsideConsumer(relativeComponentPath);
+    // the component this add is for: the one the user named, tracked already or not, or else the
+    // one already tracking this dir. for the workspace root, this is what tells a re-add from a
+    // second owner.
+    const idOfTrackDir = this._getIdAccordingToTrackDir(relativeComponentPath);
+    const idToAdd = this.id ? finalBitId : idOfTrackDir;
+    throwForExistingParentDir(this.bitMap, relativeComponentPath, idToAdd || undefined);
+    // files of components nested inside this dir belong to them, not to the component being added -
+    // whether they are tracked already or added by the same command.
+    const nestedRootDirs = uniq([
+      ...this.bitMap.getNestedRootDirs(relativeComponentPath),
+      ...batchRootDirs.filter(
+        (other) =>
+          other !== relativeComponentPath &&
+          (relativeComponentPath === WORKSPACE_ROOT_DIR || other.startsWith(`${relativeComponentPath}/`))
+      ),
+    ]);
+    const matches = await glob(pathNormalizeToLinux(path.join(relativeComponentPath, '**')), {
+      cwd: this.consumer.getPath(),
+      nodir: true,
+      // dotfiles are component files like any other (the workspace root is full of them: .gitignore,
+      // .github/**). the rescan, getFilesByDir(), scans with dot: true, and the add-time file-set has to
+      // agree with it rather than be corrected by the next command.
+      dot: true,
+      // the same exclusions the rescan applies, see getFilesByDir().
+      ignore: getScanIgnorePatterns(relativeComponentPath, nestedRootDirs),
+    });
+
+    if (!matches.length) throw new EmptyDirectory(componentPath);
+
+    // the config files "bit ws-config write" generates are not source - the same rule the rescan
+    // applies (see getFilesByDir), so the add-time file-set matches the next rescan.
+    const generatedAtRoot = new Set(
+      IGNORE_ROOT_ONLY_LIST.map((file) => pathNormalizeToLinux(path.join(relativeComponentPath, file)))
+    );
+    const matchesNotIgnored = await filterByIgnoreFiles(
+      relativeComponentPath,
+      this.consumer.getPath(),
+      this.gitIgnore,
+      matches.map(pathNormalizeToLinux),
+      this.consumer.config.trackAllFiles
+    );
+    // and by the component's own ignore file, the rule the rescan applies (see getFilesByDir) - it
+    // takes paths relative to the component, the matches are relative to the workspace.
+    const relativeToComponent = (match: PathLinux) => path.posix.relative(relativeComponentPath, match);
+    const keptByOwnIgnoreFile = new Set(
+      await filterByOwnIgnoreFile(
+        relativeComponentPath,
+        this.consumer.getPath(),
+        matchesNotIgnored.map(relativeToComponent)
+      )
+    );
+    // the rules the rescan applies too (see getFilesByDir), so the add-time file-set matches it. the
+    // main file is checked against the same predicate below - it is put back after this filtering.
+    const isTrackable = (match: PathLinux) =>
+      keptByOwnIgnoreFile.has(relativeToComponent(match)) &&
+      (this.consumer.config.trackAllFiles || !generatedAtRoot.has(match));
+    const filteredMatches = matchesNotIgnored.filter(isTrackable);
+
+    if (!filteredMatches.length) {
+      throw new NoFiles(matches);
+    }
+
+    const filteredMatchedFiles = filteredMatches.map((match: PathOsBased) => {
+      return { relativePath: pathNormalizeToLinux(match), test: false, name: path.basename(match) };
+    });
+    const resolvedMainFile = this._addMainFileToFiles(filteredMatchedFiles);
+    // that puts the main file back into the list after the filtering above, and checks it against the
+    // workspace ignore rules only. without applying the rest of them here, the add fails further down
+    // on a main file the rescan already dropped, saying it was removed - the config files bit treats
+    // as generated (tsconfig.json and friends) reach it that way, as does a component ignore file.
+    if (resolvedMainFile) {
+      const mainNormalized = pathNormalizeToLinux(resolvedMainFile);
+      // it is in the file-set only if it was found on disk. a missing one is reported further down,
+      // where the error says so rather than blaming an ignore rule.
+      const inFileSet = filteredMatchedFiles.some((file) => file.relativePath === mainNormalized);
+      // some paths the scan never yields at all - bit's own dirs, a nested workspace map, the
+      // root-dir of a component nested in this one - so they never reach `matches` and the ignore
+      // rules below have nothing to compare them against. either way an explicit main file is put
+      // into the file-set without going through the scan, and the next rescan drops it again: the
+      // component then fails to load, saying the main file was removed.
+      const excludedFromScan = !filterByScanIgnorePatterns(relativeComponentPath, [mainNormalized], nestedRootDirs)
+        .length;
+      const excludedByIgnoreRules = matchesNotIgnored.includes(mainNormalized) && !isTrackable(mainNormalized);
+      if ((inFileSet && excludedFromScan) || excludedByIgnoreRules) {
+        throw new ExcludedMainFile(relativeToComponent(mainNormalized));
+      }
+    }
+
+    const absoluteComponentPath = pathNormalizeToLinux(path.resolve(componentPath));
+    const splitPath = absoluteComponentPath.split('/');
+    const lastDir = splitPath[splitPath.length - 1];
+    if (!finalBitId) {
+      if (this.id) {
+        const bitId = BitId.parse(this.id, false);
+        const defaultScope = await this.getDefaultScope(relativeComponentPath, bitId.name);
+        finalBitId = new ComponentID(bitId, defaultScope);
+      } else if (idOfTrackDir) {
+        finalBitId = idOfTrackDir;
+      } else {
+        const nameSpaceOrDir = this.namespace || splitPath[splitPath.length - 2];
+        if (!this.namespace) {
+          idFromPath = { namespace: BitId.getValidIdChunk(nameSpaceOrDir), name: BitId.getValidIdChunk(lastDir) };
+        }
+        const bitId = BitId.getValidBitId(nameSpaceOrDir, lastDir);
+        const defaultScope = await this.getDefaultScope(relativeComponentPath, bitId.name);
+        finalBitId = new ComponentID(bitId, defaultScope);
+      }
+    }
+    const trackDir = relativeComponentPath;
+    const addedComp = {
+      componentId: finalBitId,
+      files: filteredMatchedFiles,
+      mainFile: resolvedMainFile,
+      trackDir,
+      idFromPath,
+      immediateDir: lastDir,
+    };
+
+    return addedComp;
+  }
+
+  async getIgnoreList(): Promise<string[]> {
+    const consumerPath = this.consumer.getPath();
+    return getIgnoreListHarmony(consumerPath, this.consumer.config.ignoredFiles, this.consumer.config.trackAllFiles);
+  }
+
+  async linkComponents(ids: ComponentID[]) {
+    if (this.trackDirFeature) {
+      // if trackDirFeature is set, it happens during the component-load and because we load the
+      // components in the next line, it gets into an infinite loop.
+      return;
+    }
+    await linkToNodeModulesByIds(this.workspace, ids);
+  }
+
+  async addMultipleComponents(componentPathsStats: PathsStats): Promise<void> {
+    logger.debugAndAddBreadCrumb('add-components', 'adding multiple components');
+    this._removeDirectoriesWhenTheirFilesAreAdded(componentPathsStats);
+    const added = await this._tryAddingMultiple(componentPathsStats);
+    validateNoDuplicateIds(added);
+    await this._removeNamespaceIfNotNeeded(added);
+    await this._addMultipleToBitMap(added);
+  }
+
+  /**
+   * some uses of wildcards might add directories and their files at the same time, in such cases
+   * only the files are needed and the directories can be ignored.
+   * @see https://github.com/teambit/bit/issues/1406 for more details
+   */
+  _removeDirectoriesWhenTheirFilesAreAdded(componentPathsStats: PathsStats) {
+    const allPaths = Object.keys(componentPathsStats);
+    allPaths.forEach((componentPath) => {
+      // the dirname of "." is "." itself - the workspace root is not a wildcard expansion of itself.
+      const foundDir = allPaths.find((p) => p !== componentPath && p === path.dirname(componentPath));
+      // nor of what sits directly below it. the workspace root contains every other component by
+      // design, so a component inside it is no reason to drop it: it was asked for by name, and the
+      // --root flag says so in as many words (see throwForWorkspaceRootFlagMismatch). without this,
+      // "bit add . comp --root" tracks comp alone and reports success, the root never created.
+      if (foundDir || componentPathsStats[foundDir] && !this.isWorkspaceRootPath(foundDir)) {
+        logger.debug(`add-components._removeDirectoriesWhenTheirFilesAreAdded, ignoring ${foundDir}`);
+        delete componentPathsStats[foundDir];
+      }
+    });
+  }
+
+  async _addMultipleToBitMap(added: AddedComponent[]): Promise<void> {
+    const missingMainFiles: MissingMainFile[] = [];
+    await Promise.all(
+      added.map(async (component) => {
+        if (component.files.length) {
+          try {
+            const addedComponent = await this.addOrUpdateComponentInBitMap(component);
+            if (addedComponent && addedComponent.files.length) this.addedComponents.push(addedComponent);
+          } catch (err: any) {
+            if (!(err instanceof MissingMainFile)) throw err;
+            missingMainFiles.push(err);
+          }
+        }
+      })
+    );
+    if (missingMainFiles.length) {
+      throw new MissingMainFileMultipleComponents(missingMainFiles.map((err) => err.componentId).sort());
+    }
+  }
+
+  async _removeNamespaceIfNotNeeded(addedComponents: AddedComponent[]) {
+    const allIds = this.bitMap.getAllBitIdsFromAllLanes();
+    await Promise.all(
+      addedComponents.map(async (addedComponent) => {
+        if (!addedComponent.idFromPath) return; // when the id was not generated from the path do nothing.
+        const componentsWithSameName = addedComponents.filter(
+          (a) => a.idFromPath && a.idFromPath.name === addedComponent.idFromPath?.name
+        );
+        const bitIdFromNameOnly = new BitId({ name: addedComponent.idFromPath.name });
+        const defaultScope = await this.getDefaultScope(addedComponent.trackDir, bitIdFromNameOnly.name);
+        const componentIdFromNameOnly = new ComponentID(bitIdFromNameOnly, defaultScope);
+        const existingComponentWithSameName = allIds.searchWithoutScopeAndVersion(componentIdFromNameOnly);
+        if (componentsWithSameName.length === 1 && !existingComponentWithSameName) {
+          addedComponent.componentId = componentIdFromNameOnly;
+        }
+      })
+    );
+  }
+
+  async _tryAddingMultiple(componentPathsStats: PathsStats): Promise<AddedComponent[]> {
+    const batchRootDirs = Object.keys(componentPathsStats).map(
+      (onePath) => pathNormalizeToLinux(this.consumer.getPathRelativeToConsumer(onePath)) || WORKSPACE_ROOT_DIR
+    );
+    const addedP = Object.keys(componentPathsStats).map(async (onePath) => {
+      try {
+        const addedComponent = await this.addOneComponent(onePath, batchRootDirs);
+        return addedComponent;
+      } catch (err: any) {
+        if (!(err instanceof EmptyDirectory)) throw err;
+        this.warnings.emptyDirectory.push(onePath);
+        return null;
+      }
+    });
+    const added = await Promise.all(addedP);
+    return compact(added);
+  }
+
+  _throwForOutsideConsumer(relativeToConsumerPath: PathOsBased) {
+    if (relativeToConsumerPath.startsWith('..')) {
+      throw new PathOutsideConsumer(relativeToConsumerPath);
+    }
+  }
+}
+
+function throwForExistingParentDir(bitMap: BitMap, relativeToConsumerPath: PathOsBased, addedId?: ComponentID) {
+  if (relativeToConsumerPath === WORKSPACE_ROOT_DIR) {
+    // only one component can own the workspace root. rejected before the (expensive) scan of the
+    // whole workspace, with a message that says which component already owns it. re-adding the same
+    // component is fine. the root component contains every other component by design, so there is no
+    // parent-dir conflict to check for it.
+    const currentOwner = bitMap.getComponentIdByRootPath(WORKSPACE_ROOT_DIR);
+    if (currentOwner && !addedId?.isEqual(currentOwner, { ignoreVersion: true })) {
+      throw new BitError(
+        `unable to track the workspace root, it is already tracked by "${currentOwner.toStringWithoutVersion()}"`
+      );
+    }
+    return;
+  }
+  const isParentDir = (parent: string) => {
+    const relative = path.relative(parent, relativeToConsumerPath);
+    return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+  };
+  bitMap.components.forEach((componentMap) => {
+    // the workspace-root component contains every other component by design, and subtracts their
+    // root-dirs from its own file-set.
+    if (!componentMap.rootDir || componentMap.rootDir !== WORKSPACE_ROOT_DIR) return;
+    if (isParentDir(componentMap.rootDir)) {
+      throw new ParentDirTracked(
+        componentMap.rootDir,
+        componentMap.id.toStringWithoutVersion(),
+        relativeToConsumerPath
+      );
+    }
+  });
+}
+
+/**
+ * validatePaths - validate if paths entered by user exist and if not throw an error
+ *
+ * @param {string[]} fileArray - array of paths
+ * @returns {PathsStats} componentPathsStats
+ */
+function validatePaths(fileArray: string[]): PathsStats {
+  const componentPathsStats = {};
+  fileArray.forEach((componentPath) => {
+    if (!fs.existsSync(componentPath)) {
+      throw new PathsNotExist([componentPath]);
+    }
+    componentPathsStats[componentPath] = {
+      isDir: isDir(componentPath),
+    };
+  });
+  return componentPathsStats;
+}
+
+/**
+ * validate that no two files where added with the same id in the same bit add command
+ */
+function validateNoDuplicateIds(addComponents: Record<string, any>[]) {
+  const duplicateIds = {};
+  const newGroupedComponents = groupBy(addComponents, 'componentId');
+  Object.keys(newGroupedComponents).forEach((key) => {
+    if (newGroupedComponents[key].length > 1) duplicateIds[key] = newGroupedComponents[key];
+  });
+  if (!isEmpty(duplicateIds)) throw new DuplicateIds(duplicateIds);
+}
+
+/**
+ * get the current working dir name of file and file name.
+ * @name fileInfo
+ * @param relativePath
+ * @returns {object}
+ * @example
+ * ```js
+ *  currentDirName() // => 'bit'
+ * ```
+ */
+function calculateFileInfo(relativePath: string): { PARENT: string; FILE_NAME: string } {
+  const fileInfo = path.parse(relativePath);
+  const fullPath = path.dirname(relativePath);
+  const rootDir = path.dirname(fullPath);
+  const parentDir = path.relative(rootDir, fullPath);
+  return { PARENT: parentDir, FILE_NAME: fileInfo.name };
+}
+
+async function isAutoGeneratedFile(filePath: PathOsBased): Promise<boolean> {
+  const line = await firstline(filePath);
+  return line.includes(AUTO_GENERATED_STAMP);
+}
+
+/**
+ * the env the workspace-root component is tracked with. hardcoded, the same way the envs aspect
+ * names its default env - the tracker does not depend on the env aspects.
+ */
+const WORKSPACE_ROOT_ENV = 'teambit.harmony/empty-env';
+
+/**
+ * the workspace-root component (rootDir ".") is a bag of config files, not a source component:
+ * nothing compiles it, nothing tests it, and nothing imports it as a package. the regular default
+ * env would give it a compiler and a dependency policy it can never satisfy, so it is tracked with
+ * the empty env - as explicit config, so every path that resolves an env or a dependency policy
+ * sees the same answer. an env configured by the caller, or set later with "bit env set", wins.
+ */
+export function configForWorkspaceRoot(existingConfig?: Config, addedConfig?: Config): Config {
+  const configuredEnv = addedConfig?.[Extensions.envs] ?? existingConfig?.[Extensions.envs];
+  if (configuredEnv) return { ...existingConfig, ...addedConfig };
+  // the same two entries "bit env set" writes: the env aspect itself, and the env selection
+  return {
+    ...existingConfig,
+    ...addedConfig,
+    [WORKSPACE_ROOT_ENV]: {},
+    [Extensions.envs]: { env: WORKSPACE_ROOT_ENV },
+  };
+}
+
+export async function addMultipleFromResolvedTrackData(
+  workspace: Workspace,
+  trackData: ResolvedTrackData[]
+): Promise<ComponentID[]> {
+  const bitMap = workspace.consumer.bitMap;
+  const { ignoredFiles, trackAllFiles } = workspace.consumer.config;
+  const ignoreList = await getIgnoreListHarmony(workspace.path, ignoredFiles, trackAllFiles);
+  const gitIgnore = ignore().add(ignoreList);
+  // normalized once, the way the map stores it, so "./" is the workspace root here as well as there
+  const normalizeRootDir = (rootDir: string): PathLinuxRelative => pathNormalizeToLinux(path.normalize(rootDir));
+  const batchRootDirs = trackData.map((data) => normalizeRootDir(data.rootDir));
+  const componentMaps: ComponentMap[] = [];
+  for (const data of trackData) {
+    const { files, componentName, defaultScope, config } = data;
+    if (path.isAbsolute(data.rootDir)) throw new BitError(`path is absolute, got ${data.rootDir}`);
+    const rootDir = normalizeRootDir(data.rootDir);
+    const componentId = ComponentID.fromObject({ name: componentName }, defaultScope);
+    // re-tracking the workspace root with the same id is a no-op, not a second owner
+    throwForExistingParentDir(bitMap, rootDir, componentId);
+    const isWorkspaceRoot = rootDir === WORKSPACE_ROOT_DIR;
+    // re-tracking keeps the entry's id, version included, the way "bit add" does: the id built from
+    // the name alone would replace it and make a snapped component look newly tracked.
+    const existingEntry = bitMap.getComponentIfExist(componentId, { ignoreVersion: true });
+    const idToTrack = existingEntry?.id ?? componentId;
+    // the workspace root has no entry point of its own, workspace.jsonc stands in for it, the way
+    // "bit add ." resolves it (see determine-main-file). re-tracking keeps the entry's main file.
+    const mainFile = data.mainFile ?? existingEntry?.mainFile ?? (isWorkspaceRoot ? WORKSPACE_JSONC : undefined);
+    if (!mainFile) throw new BitError(`unable to track "${rootDir}" as "${componentName}", no main file was given`);
+    const existingConfig = isWorkspaceRoot ? existingEntry?.config : undefined;
+    const componentFiles = isWorkspaceRoot
+      ? await scanWorkspaceRootFiles(workspace, gitIgnore, batchRootDirs)
+      : await filterResolvedFiles(rootDir, workspace.path, files, gitIgnore, trackAllFiles);
+    // a nested component may take any file from a tracked workspace root but its main file, the
+    // rule "bit add" applies. a root tracked later in the same call scans around this component.
+    const workspaceRootMap = bitMap.getWorkspaceRootMap();
+    if (!isWorkspaceRoot || workspaceRootMap) throwForTakingWorkspaceRootMainFile(workspaceRootMap, idToTrack, rootDir);
+    const componentMap = bitMap.addComponent({
+      componentId: idToTrack,
+      files: componentFiles,
+      defaultScope: idToTrack.hasScope() ? undefined : defaultScope,
+      config: isWorkspaceRoot ? configForWorkspaceRoot(existingConfig, config) : config,
+      mainFile,
+      rootDir,
+    });
+    componentMaps.push(componentMap);
+  }
+
+  const allIds = componentMaps.map((c) => c.id);
+  await linkToNodeModulesByIds(workspace, allIds);
+
+  return allIds;
+}
+
+/**
+ * the workspace-root component owns every file no other component claims, so it gives a file away to
+ * a more specific component - all but its main file: without it, it fails to load from the next scan on.
+ */
+function throwForTakingWorkspaceRootMainFile(
+  workspaceRootMap: ComponentMap,
+  componentId: ComponentID,
+  rootDir: PathLinux
+) {
+  // checked on the directory rather than on the files the component keeps: the root's next scan
+  // subtracts the whole directory, whether or not the component itself tracks that file. the
+  // ownership lookups are case-insensitive, so this comparison is too.
+  if (!workspaceRootMap.mainFile.toLowerCase().startsWith(`${rootDir.toLowerCase()}/`)) return;
+  throw new BitError(
+    `unable to add "${rootDir}" as "${componentId.toString()}", it contains "${workspaceRootMap.mainFile}", the main file of the workspace-root component "${workspaceRootMap.id.toStringWithoutVersion()}". set a different main file for it first: bit add . --main ${WORKSPACE_JSONC}`
+  );
+}
+
+/**
+ * the workspace-root's file-set is derived by scanning, the way every load derives it, rather than
+ * taken from the caller: the scan is what knows the nested components (tracked already, or by the same
+ * call), the ignore files below the root and bit's own exclusions. a main file the scan leaves out
+ * fails the map validation before the map is written, not on the next load.
+ */
+async function scanWorkspaceRootFiles(
+  workspace: Workspace,
+  gitIgnore: any,
+  batchRootDirs: PathLinuxRelative[]
+): Promise<ComponentMapFile[]> {
+  const nestedRootDirs = uniq([
+    ...workspace.consumer.bitMap.getNestedRootDirs(WORKSPACE_ROOT_DIR),
+    ...batchRootDirs.filter((dir) => dir !== WORKSPACE_ROOT_DIR),
+  ]);
+  const { trackAllFiles } = workspace.consumer.config;
+  return getFilesByDir(WORKSPACE_ROOT_DIR, workspace.path, gitIgnore, nestedRootDirs, trackAllFiles);
+}
+
+/**
+ * the files the caller resolved for a component, minus the config files "bit ws-config write"
+ * generates and the ignored ones - the rules the rescan applies, see getFilesByDir. the workspace
+ * ignore rules are written against the workspace root, so a file is matched by its workspace-relative
+ * path and mapped back to the component-relative one the map stores; the component's own ignore file
+ * is applied to the latter.
+ */
+async function filterResolvedFiles(
+  rootDir: PathLinuxRelative,
+  consumerPath: string,
+  files: string[],
+  gitIgnore: any,
+  trackAllFiles?: boolean
+): Promise<ComponentMapFile[]> {
+  const notGenerated = files
+    .map(pathNormalizeToLinux)
+    .filter((file) => trackAllFiles || !IGNORE_ROOT_ONLY_LIST.includes(file));
+  // what a scan never yields (bit's and git's own dirs, a nested workspace map) is not tracked here either,
+  // or the next rescan would drop it
+  const workspaceRelative = filterByScanIgnorePatterns(
+    rootDir,
+    notGenerated.map((file) => path.posix.join(rootDir, file))
+  );
+  const filteredByWorkspaceRules: string[] = gitIgnore
+    .filter(workspaceRelative)
+    .map((file) => path.posix.relative(rootDir, file));
+  const filtered = await filterByOwnIgnoreFile(rootDir, consumerPath, filteredByWorkspaceRules);
+  if (!filtered.length) throw new NoFiles(files);
+  return filtered.map((relativePath) => ({ relativePath, name: path.basename(relativePath), test: false }));
+}

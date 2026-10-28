@@ -1,0 +1,706 @@
+/* eslint-disable import/first */
+import { expect } from 'chai';
+import sinon from 'sinon';
+import { ComponentID } from '@teambit/component';
+import path from 'path';
+import { Http } from '@teambit/scope.network';
+import { DependencyResolverMain } from './dependency-resolver.main.runtime';
+import { VariantPolicy } from './policy';
+
+const logger = {
+  debug: () => {},
+};
+
+function createDependencyResolverMain(envs: Record<string, any> = {}) {
+  return new DependencyResolverMain(
+    {} as any,
+    {} as any,
+    {} as any,
+    envs as any,
+    logger as any,
+    {} as any,
+    {} as any,
+    {} as any,
+    {} as any,
+    {
+      get: () => ({
+        getNetworkConfig: () => ({}),
+      }),
+    } as any,
+    {} as any,
+    {} as any,
+    {} as any,
+    {} as any
+  );
+}
+
+describe('DepenendencyResolverMain.validateAspectData()', () => {
+  it('should accept git+ssh dependency policy versions', () => {
+    const depResolver = createDependencyResolverMain();
+    expect(
+      depResolver.validateAspectData({
+        dependencies: [],
+        policy: [
+          {
+            dependencyId: 'private-pkg',
+            value: {
+              version: 'git+ssh://git@github.com/org/private-pkg.git',
+            },
+          },
+        ],
+      } as any)
+    ).to.equal(undefined);
+  });
+  for (const version of ['+', '+^', '+~']) {
+    it(`should accept "${version}" as a policy version of a component`, () => {
+      const depResolver = createDependencyResolverMain();
+      expect(
+        depResolver.validateAspectData({
+          dependencies: [
+            {
+              __type: 'component',
+              id: 'org.scope/comp@0.0.1',
+              version: '0.0.1',
+              packageName: '@org/scope.comp',
+              versionRange: version,
+            },
+          ],
+          policy: [{ dependencyId: '@org/scope.comp', value: { version } }],
+        } as any)
+      ).to.equal(undefined);
+    });
+  }
+  it('should reject an unknown "+" spec as a policy version', () => {
+    const depResolver = createDependencyResolverMain();
+    const result = depResolver.validateAspectData({
+      dependencies: [],
+      policy: [{ dependencyId: 'some-pkg', value: { version: '+>' } }],
+    } as any);
+    expect(result?.errorMsg).to.include('"+>"');
+  });
+});
+
+describe('DependencyResolverMain.getComponentEnvPolicyFromExtension()', () => {
+  const envId = 'some-scope/envs/code-env@1.0.0';
+  // an env that defines its policy in code (no env.jsonc). when it's not loaded, the env definition is the default env.
+  const createWithEnv = (envDefinitionId: string) =>
+    createDependencyResolverMain({
+      calculateEnvIdFromExtensions: async () => envId,
+      isCoreEnv: () => false,
+      getEnvComponentByEnvId: async () => ({}),
+      getOrCalculateEnvManifest: async () => undefined,
+      calculateEnvFromExtensions: async () => ({ id: envDefinitionId, env: {} }),
+    });
+  const storedPolicy = VariantPolicy.fromConfigObject({ dependencies: { 'some-pkg': '1.0.0' } }, { source: 'env' });
+  it('should return the given policy when the env is not loaded', async () => {
+    const depResolver = createWithEnv('teambit.harmony/node');
+    expect(await depResolver.getComponentEnvPolicyFromExtension({} as any, storedPolicy)).to.equal(storedPolicy);
+  });
+  it('should return the policy of the env when it is loaded', async () => {
+    const depResolver = createWithEnv(envId);
+    expect(await depResolver.getComponentEnvPolicyFromExtension({} as any, storedPolicy)).to.not.equal(storedPolicy);
+  });
+});
+
+describe('DependencyResolverMain.getEnvPolicyFromComponents()', () => {
+  // the env of the component is stored as 1.0.0, while its files in memory (e.g. merged) are of another version
+  const envFiles = [{ basename: 'env.jsonc' }];
+  const createEnvComponent = (files: Array<{ basename: string }>) => ({
+    id: ComponentID.fromString('some-scope/envs/jsonc-env@2.0.0'),
+    state: { _consumer: { files, dependencies: { get: () => [] } } },
+  });
+  const depResolver = createDependencyResolverMain({
+    calculateEnvIdFromExtensions: async () => 'some-scope/envs/jsonc-env@1.0.0',
+    isCoreEnv: () => false,
+    // the env.jsonc is read from the given files, not from the stored env
+    calculateEnvManifest: async (_envComponent, legacyFiles) =>
+      legacyFiles === envFiles ? { policy: { dev: [{ name: 'some-pkg', version: '2.0.0' }] } } : undefined,
+  });
+  it('should return the policy of the env.jsonc of the env component in memory', async () => {
+    const policy = await depResolver.getEnvPolicyFromComponents({} as any, [createEnvComponent(envFiles) as any]);
+    expect(policy?.find('some-pkg')?.value.version).to.equal('2.0.0');
+  });
+  it('should return undefined when the env is not one of the given components', async () => {
+    const otherComponent = { ...createEnvComponent(envFiles), id: ComponentID.fromString('some-scope/other@1.0.0') };
+    expect(await depResolver.getEnvPolicyFromComponents({} as any, [otherComponent as any])).to.equal(undefined);
+  });
+  it('should return undefined when the env component has no env.jsonc', async () => {
+    const envComponent = createEnvComponent([{ basename: 'index.ts' }]);
+    expect(await depResolver.getEnvPolicyFromComponents({} as any, [envComponent as any])).to.equal(undefined);
+  });
+});
+
+describe('DepenendencyResolverMain.isValidVersionSpecifier()', () => {
+  const depResolver = createDependencyResolverMain();
+  for (const spec of [
+    'npm:uri-js-replace',
+    'npm:@scope/pkg',
+    'npm:@scope/pkg@1.0.0',
+    'npm:pkg@^1.0.0',
+    '1.2.3',
+    '^1.0.0',
+    'latest',
+  ]) {
+    it(`should accept ${spec}`, () => {
+      expect(depResolver.isValidVersionSpecifier(spec)).to.equal(true);
+    });
+  }
+  for (const spec of ['npm:', 'npm:@scope', 'npm:pkg name', '']) {
+    it(`should reject "${spec}"`, () => {
+      expect(depResolver.isValidVersionSpecifier(spec)).to.equal(false);
+    });
+  }
+});
+
+describe('DepenendencyResolverMain.getNetworkConfig()', () => {
+  let httpStub: sinon.SinonStub;
+  let packageManagerSlot: any;
+
+  beforeEach(() => {
+    httpStub = sinon.stub(Http, 'getNetworkConfig');
+    packageManagerSlot = {
+      get: sinon.stub().returns({
+        getNetworkConfig: () => ({}),
+      }),
+    };
+  });
+
+  afterEach(() => {
+    sinon.restore();
+  });
+  it('should return settings from global config', async () => {
+    const depResolver = new DependencyResolverMain(
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      logger as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    const globalConfig = {
+      fetchTimeout: 1,
+      fetchRetries: 2,
+      fetchRetryFactor: 3,
+      fetchRetryMintimeout: 4,
+      fetchRetryMaxtimeout: 5,
+      networkConcurrency: 6,
+      maxSockets: 7,
+    };
+    httpStub.resolves(globalConfig);
+    expect(await depResolver.getNetworkConfig()).to.deep.equal(globalConfig);
+  });
+  it('should return settings from package manager config', async () => {
+    const depResolver = new DependencyResolverMain(
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      logger as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    const pmConfig = {
+      fetchTimeout: 11,
+      fetchRetries: 22,
+      fetchRetryFactor: 33,
+      fetchRetryMintimeout: 44,
+      fetchRetryMaxtimeout: 55,
+      networkConcurrency: 66,
+      maxSockets: 77,
+    };
+    packageManagerSlot.get.returns({
+      getNetworkConfig: () => pmConfig,
+    });
+    httpStub.resolves({});
+    expect(await depResolver.getNetworkConfig()).to.deep.equal(pmConfig);
+  });
+  it('should return settings from aspect config', async () => {
+    const config = {
+      fetchTimeout: 111,
+      fetchRetries: 222,
+      fetchRetryFactor: 333,
+      fetchRetryMintimeout: 444,
+      fetchRetryMaxtimeout: 555,
+      networkConcurrency: 666,
+      maxSockets: 777,
+    } as any;
+    httpStub.resolves({});
+    const depResolver = new DependencyResolverMain(
+      config,
+      {} as any,
+      {} as any,
+      {} as any,
+      logger as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    expect(await depResolver.getNetworkConfig()).to.deep.equal(config);
+  });
+  it('should merge settings from global config, package manager config, and aspect config', async () => {
+    const globalConfig = {
+      fetchTimeout: 1,
+      fetchRetries: 2,
+    };
+    const pmConfig = {
+      fetchRetryFactor: 33,
+      fetchRetryMintimeout: 44,
+    };
+    const config = {
+      fetchRetryMaxtimeout: 555,
+      networkConcurrency: 666,
+      maxSockets: 777,
+    } as any;
+    httpStub.resolves(globalConfig);
+    packageManagerSlot.get.returns({
+      getNetworkConfig: () => pmConfig,
+    });
+    const depResolver = new DependencyResolverMain(
+      config,
+      {} as any,
+      {} as any,
+      {} as any,
+      logger as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    expect(await depResolver.getNetworkConfig()).to.deep.equal({
+      fetchTimeout: 1,
+      fetchRetries: 2,
+      fetchRetryFactor: 33,
+      fetchRetryMintimeout: 44,
+      fetchRetryMaxtimeout: 555,
+      networkConcurrency: 666,
+      maxSockets: 777,
+    });
+  });
+  it('should read cafile when it is returned by the global config', async () => {
+    const depResolver = new DependencyResolverMain(
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { debug: sinon.stub() } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    httpStub.resolves({
+      cafile: path.join(__dirname, 'fixtures/cafile.txt'),
+    });
+    expect((await depResolver.getNetworkConfig()).ca).to.deep.equal([
+      `-----BEGIN CERTIFICATE-----
+XXXX
+-----END CERTIFICATE-----`,
+    ]);
+  });
+});
+
+describe('DepenendencyResolverMain.getOutdatedPkgsFromPolicies()', () => {
+  function createDependencyResolverForOutdatedPolicies(
+    resolveRemoteVersion: (spec: string) => { version: string | undefined },
+    policy: any
+  ) {
+    const packageManagerSlot = {
+      get: () => ({
+        resolveRemoteVersion,
+        getNetworkConfig: () => ({}),
+      }),
+    };
+    return new DependencyResolverMain(
+      { policy } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {
+        debug: sinon.stub(),
+        setStatusLine: sinon.stub(),
+        consoleSuccess: sinon.stub(),
+      } as any,
+      {} as any,
+      {} as any,
+      {
+        getConfig: () => false,
+      } as any,
+      {} as any,
+      packageManagerSlot as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+  }
+  describe('without options', () => {
+    function resolveRemoteVersion(spec: string): { version: string | undefined } {
+      if (spec === 'cannot-resolve@latest') throw new Error('Cannot resolve latest');
+      return {
+        version: {
+          'root-runtime-dep1@latest': '2.0.0',
+          'root-peer-dep1@latest': '2.0.0',
+          'variant1-runtime-dep1@latest': '2.0.0',
+          'variant1-runtime-dep3@latest': '2.0.0',
+          'variant1-dev-dep1@latest': '2.0.0',
+          'variant1-dev-dep3@latest': '2.0.0',
+          'variant1-peer-dep1@latest': '2.0.0',
+          'variant1-peer-dep3@latest': '2.0.0',
+          'component1-runtime-dep1@latest': '2.0.0',
+          'component1-runtime-dep3@latest': '2.0.0',
+          'component1-dev-dep1@latest': '2.0.0',
+          'component1-dev-dep3@latest': '2.0.0',
+          'component1-peer-dep1@latest': '2.0.0',
+          'component1-peer-dep3@latest': '2.0.0',
+          'pkg-with-old-latest@latest': '0.0.0',
+        }[spec],
+      };
+    }
+    const policy = {
+      dependencies: {
+        'root-runtime-dep1': '1.0.0',
+        'root-runtime-dep2': '1.0.0',
+      },
+      peerDependencies: {
+        'root-peer-dep1': '1.0.0',
+        'root-peer-dep2': '1.0.0',
+      },
+    };
+    const depResolver = createDependencyResolverForOutdatedPolicies(resolveRemoteVersion, policy);
+    it('should return outdated dependencies', async () => {
+      const outdatedPkgs = await depResolver.getOutdatedPkgsFromPolicies({
+        rootDir: '',
+        variantPoliciesByPatterns: {
+          '{variant1/*}': {
+            dependencies: {
+              'variant1-runtime-dep1': '1.0.0',
+              'variant1-runtime-dep2': '1.0.0',
+              'variant1-runtime-dep3': '-',
+            },
+            devDependencies: {
+              'variant1-dev-dep1': '1.0.0',
+              'variant1-dev-dep2': '1.0.0',
+              'variant1-dev-dep3': '-',
+            },
+            peerDependencies: {
+              'variant1-peer-dep1': '1.0.0',
+              'variant1-peer-dep2': '1.0.0',
+              'variant1-peer-dep3': '-',
+            },
+          },
+        },
+        componentPolicies: [
+          {
+            componentId: ComponentID.fromString('scope/component1'),
+            policy: {
+              dependencies: {
+                'pkg-with-old-latest': '1.0.0',
+                'cannot-resolve': '1.0.0',
+                'component1-runtime-dep1': '1.0.0',
+                'component1-runtime-dep2': '1.0.0',
+                'component1-runtime-dep3': '-',
+              },
+              devDependencies: {
+                'component1-dev-dep1': '1.0.0',
+                'component1-dev-dep2': '1.0.0',
+                'component1-dev-dep3': '-',
+              },
+              peerDependencies: {
+                'component1-peer-dep1': '1.0.0',
+                'component1-peer-dep2': '1.0.0',
+                'component1-peer-dep3': '-',
+              },
+            },
+          },
+        ],
+        components: [],
+      });
+      expect(outdatedPkgs).to.deep.equal([
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'root-runtime-dep1',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'root-peer-dep1',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'peerDependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'variant1-runtime-dep1',
+          source: 'variants',
+          variantPattern: '{variant1/*}',
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'variant1-dev-dep1',
+          source: 'variants',
+          variantPattern: '{variant1/*}',
+          targetField: 'devDependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'variant1-peer-dep1',
+          source: 'variants',
+          variantPattern: '{variant1/*}',
+          targetField: 'peerDependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'component1-runtime-dep1',
+          source: 'component',
+          componentId: ComponentID.fromString('scope/component1'),
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'component1-dev-dep1',
+          source: 'component',
+          componentId: ComponentID.fromString('scope/component1'),
+          targetField: 'devDependencies',
+        },
+        {
+          currentRange: '1.0.0',
+          latestRange: '2.0.0',
+          name: 'component1-peer-dep1',
+          source: 'component',
+          componentId: ComponentID.fromString('scope/component1'),
+          targetField: 'peerDependencies',
+        },
+      ]);
+    });
+  });
+  describe('forced version bump', () => {
+    function resolveRemoteVersion(spec: string): { version: string | undefined } {
+      return {
+        version: {
+          'dep1@>=0.0.1 <0.1.0': '0.0.2',
+          'dep1@>=0.0.1 <1.0.0': '0.0.2',
+          'dep1@latest': '0.0.2',
+
+          'dep2@>=0.1.0 <0.2.0': '0.1.0',
+          'dep2@>=0.1.0 <1.0.0': '0.2.0',
+          'dep2@latest': '0.2.0',
+
+          'dep3@>=1.0.0 <1.1.0': '1.0.0',
+          'dep3@>=1.0.0 <2.0.0': '1.0.0',
+          'dep3@latest': '2.0.0',
+        }[spec],
+      };
+    }
+    const policy = {
+      dependencies: {
+        dep1: '0.0.1',
+        dep2: '^0.1.0',
+        dep3: '^1.0.0',
+      },
+    };
+    const depResolver = createDependencyResolverForOutdatedPolicies(resolveRemoteVersion, policy);
+    it('should return outdated dependencies when forcedVersionBump is set to patch', async () => {
+      const outdatedPkgs = await depResolver.getOutdatedPkgsFromPolicies({
+        rootDir: '',
+        variantPoliciesByPatterns: {},
+        componentPolicies: [],
+        components: [],
+        forceVersionBump: 'patch',
+      });
+      expect(outdatedPkgs).to.deep.equal([
+        {
+          currentRange: '0.0.1',
+          latestRange: '0.0.2',
+          name: 'dep1',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+      ]);
+    });
+    it('should return outdated dependencies when forcedVersionBump is set to minor', async () => {
+      const outdatedPkgs = await depResolver.getOutdatedPkgsFromPolicies({
+        rootDir: '',
+        variantPoliciesByPatterns: {},
+        componentPolicies: [],
+        components: [],
+        forceVersionBump: 'minor',
+      });
+      expect(outdatedPkgs).to.deep.equal([
+        {
+          currentRange: '0.0.1',
+          latestRange: '0.0.2',
+          name: 'dep1',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '^0.1.0',
+          latestRange: '^0.2.0',
+          name: 'dep2',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+      ]);
+    });
+    it('should return outdated dependencies when forcedVersionBump is set to major', async () => {
+      const outdatedPkgs = await depResolver.getOutdatedPkgsFromPolicies({
+        rootDir: '',
+        variantPoliciesByPatterns: {},
+        componentPolicies: [],
+        components: [],
+        forceVersionBump: 'major',
+      });
+      expect(outdatedPkgs).to.deep.equal([
+        {
+          currentRange: '0.0.1',
+          latestRange: '0.0.2',
+          name: 'dep1',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '^0.1.0',
+          latestRange: '^0.2.0',
+          name: 'dep2',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+        {
+          currentRange: '^1.0.0',
+          latestRange: '^2.0.0',
+          name: 'dep3',
+          source: 'rootPolicy',
+          variantPattern: null,
+          targetField: 'dependencies',
+        },
+      ]);
+    });
+  });
+});
+
+describe('DepenendencyResolverMain.getComponentEnvPolicyFromEnv()', () => {
+  it('should throw an error if the env policy has a peer with an empty string set for the supportedRange', async () => {
+    const depResolver = new DependencyResolverMain(
+      {} as any,
+      {} as any,
+      {} as any,
+      {
+        isCoreEnv: () => false,
+      } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    try {
+      await depResolver.getComponentEnvPolicyFromEnv(
+        {
+          getDependencies: () => ({
+            peers: [
+              {
+                name: '@teambit/community.ui.bit-cli.commands-provider',
+                supportedRange: '',
+                version: '',
+              },
+            ],
+          }),
+        },
+        { envId: 'teambit.test/test' }
+      );
+      expect.fail('Expected method to throw');
+    } catch (error: any) {
+      expect(error.message).to.equal(
+        'Peer "@teambit/community.ui.bit-cli.commands-provider" has an empty supportedRange'
+      );
+    }
+  });
+});
+
+describe('DepenendencyResolverMain.getEnvJsoncPolicyPkgs()', () => {
+  it('should not return env.jsonc entries with a plus version, as they follow the workspace version', () => {
+    const depResolver = new DependencyResolverMain(
+      {} as any,
+      {} as any,
+      {} as any,
+      { isEnv: () => true } as any,
+      logger as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any
+    );
+    const envJsonc = {
+      policy: {
+        peers: [
+          { name: 'plus-pkg', version: '+', supportedRange: '+^' },
+          { name: 'plus-caret-pkg', version: '+^', supportedRange: '+^' },
+          { name: 'fixed-pkg', version: '1.0.0', supportedRange: '^1.0.0' },
+        ],
+        runtime: [{ name: 'plus-runtime-pkg', version: '+~' }],
+      },
+    };
+    const component = {
+      id: ComponentID.fromString('scope/my-env'),
+      filesystem: { files: [{ relative: 'env.jsonc', contents: Buffer.from(JSON.stringify(envJsonc)) }] },
+    };
+    const pkgs = depResolver.getEnvJsoncPolicyPkgs([component as any]);
+    expect(pkgs.map((pkg) => pkg.name)).to.deep.equal(['fixed-pkg']);
+  });
+});

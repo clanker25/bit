@@ -1,0 +1,19 @@
+{
+    "compilerOptions": {
+      "jsx": "react",
+      "experimentalDecorators": true,
+      "emitDecoratorMetadata": true,
+      "strict": true,
+      "moduleResolution": "node",
+      "module": "commonjs",
+      "target": "es2015",
+      "skipLibCheck": false,
+      "noImplicitAny": true,
+      "preserveConstEnums": true,
+      "strictPropertyInitialization": false,
+      "esModuleInterop": true,
+      "resolveJsonModule": true,
+      "sourceMap": true,
+      "outDir": "./dist"
+    },
+  }

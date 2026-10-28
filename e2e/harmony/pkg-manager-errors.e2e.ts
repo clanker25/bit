@@ -1,0 +1,59 @@
+import { expect } from 'chai';
+import { Helper } from '@teambit/legacy.e2e-helper';
+
+// named for "bit checkout" historically, but it covers every command that installs as a side effect:
+// checkout, switch and import all have to surface a package-manager failure instead of throwing.
+describe('commands that install, when the package-manager fails', function () {
+  this.timeout(0);
+  let helper: Helper;
+  before(() => {
+    helper = new Helper();
+  });
+  after(() => {
+    helper.scopeHelper.destroy();
+  });
+  describe('component with a non-exist package dependency which triggers the package-manager to fail', () => {
+    let afterExport: string;
+    before(() => {
+      helper.scopeHelper.setWorkspaceWithRemoteScope();
+      helper.fixtures.populateComponents(1, false);
+      helper.command.dependenciesSet('comp1', 'bit-non-exist-pkg@1.0.0');
+      helper.command.tagAllWithoutBuild('--ignore-issues="*"');
+      helper.command.tagAllWithoutBuild('--unmodified --ignore-issues="*"');
+      helper.command.export();
+      afterExport = helper.scopeHelper.cloneWorkspace();
+    });
+    describe('bit checkout', () => {
+      it('should not throw, instead, should show the error in the output', () => {
+        const output = helper.command.checkoutVersion('0.0.1', 'comp1');
+        expect(output).to.have.string('Installation Error');
+        // this is the actual error coming from the package-manager
+        // the full error is: `GET https://node-registry.bit.cloud/bit-non-exist-pkg: Not Found - 404`
+        expect(output).to.have.string('404');
+      });
+    });
+    describe('bit switch', () => {
+      before(() => {
+        helper.scopeHelper.getClonedWorkspace(afterExport);
+        helper.command.createLane();
+        helper.command.snapAllComponentsWithoutBuild('--unmodified');
+      });
+      it('should not throw', () => {
+        const output = helper.command.switchLocalLane('main');
+        expect(output).to.have.string('Installation Error');
+        expect(output).to.have.string('404');
+      });
+    });
+    describe('bit import', () => {
+      before(() => {
+        helper.scopeHelper.reInitWorkspace();
+        helper.scopeHelper.addRemoteScope();
+      });
+      it('should not throw', () => {
+        const output = helper.command.importComponent('comp1');
+        expect(output).to.have.string('Installation Error');
+        expect(output).to.have.string('404');
+      });
+    });
+  });
+});
